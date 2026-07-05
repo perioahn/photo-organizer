@@ -1,0 +1,59 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements.txt pyinstaller
+      - run: >
+          pyinstaller --noconfirm --onedir --name PhotoApp
+          --collect-all rapidocr_onnxruntime
+          --exclude-module transformers --exclude-module torch
+          --exclude-module tensorflow --exclude-module matplotlib
+          --exclude-module pandas
+          --add-data "frontend/dist;frontend/dist"
+          run.py
+      - run: Compress-Archive -Path dist/PhotoApp -DestinationPath PhotoApp-windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhotoApp-windows
+          path: PhotoApp-windows.zip
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: PhotoApp-windows.zip
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements.txt pyinstaller
+      - run: >
+          pyinstaller --noconfirm --onedir --windowed --name PhotoApp
+          --collect-all rapidocr_onnxruntime
+          --exclude-module transformers --exclude-module torch
+          --exclude-module tensorflow --exclude-module matplotlib
+          --exclude-module pandas
+          --add-data "frontend/dist:frontend/dist"
+          run.py
+      - run: ditto -c -k --keepParent dist/PhotoApp.app PhotoApp-macos.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhotoApp-macos
+          path: PhotoApp-macos.zip
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: PhotoApp-macos.zip
