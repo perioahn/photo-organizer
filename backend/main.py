@@ -160,21 +160,12 @@ def select_folder(initial: str = Body(default="", embed=True)) -> dict:
             r = subprocess.run(["osascript", "-e", script], capture_output=True, timeout=300)
             path = r.stdout.decode("utf-8", "replace").strip().rstrip("/")
         else:
-            ps = (
-                "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
-                "Add-Type -AssemblyName System.Windows.Forms;"
-                "$f = New-Object System.Windows.Forms.FolderBrowserDialog;"
-                "$f.Description = '폴더 선택';"
-            )
-            if initial and os.path.isdir(initial) and "'" not in initial:
-                ps += f"$f.SelectedPath = '{initial}';"
-            ps += (
-                "$top = New-Object System.Windows.Forms.Form -Property @{TopMost=$true; "
-                "WindowState='Minimized'; ShowInTaskbar=$false};"
-                "if ($f.ShowDialog($top) -eq 'OK') { Write-Output $f.SelectedPath }"
-            )
-            r = subprocess.run(["powershell", "-STA", "-NoProfile", "-Command", ps],
-                               capture_output=True, timeout=300)
+            script = os.path.join(os.path.dirname(__file__), "folder_dialog.ps1")
+            args = ["powershell", "-STA", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                    "-File", script]
+            if initial and os.path.isdir(initial):
+                args += ["-Initial", initial]
+            r = subprocess.run(args, capture_output=True, timeout=300)
             path = r.stdout.decode("utf-8", "replace").strip()
     except (OSError, subprocess.TimeoutExpired):
         raise HTTPException(500, "폴더 선택 다이얼로그 실패")
@@ -341,7 +332,7 @@ def tag_groups() -> list[dict]:
         cat = tagsort.category_of(tag, cfg)
         groups.setdefault(cat, []).append({"tag": tag, "count": counts.get(tag, 0)})
     out = []
-    for order, name in enumerate(tagsort.CAT_ORDER):
+    for order, name in enumerate(tagsort.cat_order(cfg)):
         tags = groups.pop(name, [])
         if not tags:
             continue
@@ -519,6 +510,17 @@ async def import_item_action(idx: int, action: str = Body(embed=True)) -> dict:
     return importer.get_session() or {}
 
 
+@app.post("/api/import/merge")
+async def import_merge(src: int = Body(embed=True), dst: int = Body(embed=True)) -> dict:
+    """그룹 src를 dst로 병합 (드래그&드롭)."""
+    from . import importer
+    try:
+        await asyncio.to_thread(importer.merge_groups, src, dst)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return importer.get_session() or {}
+
+
 @app.post("/api/import/commit")
 async def import_commit() -> dict:
     require_root()
@@ -598,6 +600,35 @@ async def pdfs_rescan() -> dict:
 async def rescan() -> dict:
     require_root()
     return await asyncio.to_thread(scanner.full_scan, ROOT)
+
+
+@app.post("/api/cleanup_thumbnails")
+async def cleanup_thumbnails(dry_run: bool = Body(default=True, embed=True)) -> dict:
+    """구버전 앱이 원본 옆에 만든 thumbnail_*.jpg 잔재 삭제.
+
+    dry_run=true = 개수만 집계. 실제 삭제는 영구 삭제(저널 없음)라 프론트에서 확인 후 호출.
+    """
+    require_root()
+
+    def _run() -> dict:
+        targets = []
+        for base, _dirs, files in os.walk(ROOT):
+            for n in files:
+                if n.startswith("thumbnail_") and n.lower().endswith(".jpg"):
+                    targets.append(os.path.join(base, n))
+        if dry_run:
+            return {"found": len(targets), "deleted": 0}
+        deleted = 0
+        with writer.write_lock, db.fs_lock, db.ProcessLock():
+            for p in targets:
+                try:
+                    os.remove(p)
+                    deleted += 1
+                except OSError:
+                    log.warning("썸네일 삭제 실패: %s", p)
+        return {"found": len(targets), "deleted": deleted}
+
+    return await asyncio.to_thread(_run)
 
 
 # ── 쓰기 (Phase 2): 모든 파일시스템 변경은 writer 경유 ─────────────

@@ -1,9 +1,14 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { api, sortTagsForDisplay, type FileEntry, type FolderNode } from '../api'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { api, loadTagRanks, sortTagsForDisplay, type FileEntry, type FolderNode } from '../api'
 import TagPicker from './TagPicker.vue'
 
-const props = defineProps<{ folder: FolderNode; nested?: boolean }>()
+const props = defineProps<{
+  folder: FolderNode
+  nested?: boolean
+  showSub?: boolean // 하위 폴더 전역 펼침 (기본 접힘)
+  patientLabel?: string // 날짜순 평면 목록에서 카드에 환자 표기
+}>()
 const emit = defineEmits<{
   open: [payload: { files: FileEntry[]; index: number; folder: FolderNode }]
   pdf: [date6: string | null]
@@ -35,6 +40,7 @@ async function applyTags(add: string[], remove: string[]) {
     const r = await api.editTags(props.folder.id, add, remove)
     props.folder.name = r.new
     emit('written', r.run_id, `${r.old} → ${r.new}`)
+    if (add.length) loadTagRanks(true).catch(() => {}) // 새 태그 → 피커/표기순서 즉시 갱신
   } catch (e: any) {
     props.folder.tags = before
     emit('written', null, `태그 변경 실패: ${e.message ?? e}`)
@@ -87,11 +93,16 @@ function fmtDate(d: string | null): string {
 function openAt(i: number) {
   emit('open', { files: files.value, index: i, folder: props.folder })
 }
+
+// 하위 폴더: 기본 접힘, 전역 토글 따라가되 카드에서 개별 펼침도 가능
+const subOpen = ref(props.showSub ?? false)
+watch(() => props.showSub, (v) => { subOpen.value = v ?? false })
 </script>
 
 <template>
   <div ref="el" class="folder-card" :class="{ irregular: !folder.is_regular, nested }">
     <div class="folder-head">
+      <span v-if="patientLabel" class="fpatient">{{ patientLabel }}</span>
       <span v-if="folder.date6" class="fdate">{{ fmtDate(folder.date6) }}</span>
       <span v-else class="fname">{{ folder.name }}</span>
       <span
@@ -141,14 +152,22 @@ function openAt(i: number) {
       <div v-for="i in Math.min(folder.image_count || 1, 8)" :key="i" class="skel" />
     </div>
 
-    <FolderCard
-      v-for="c in folder.children"
-      :key="c.id"
-      :folder="c"
-      nested
-      @open="(p) => emit('open', p)"
-      @pdf="(d) => emit('pdf', d)"
-      @written="(r, m) => emit('written', r, m)"
-    />
+    <button
+      v-if="folder.children.length"
+      class="sub-toggle"
+      @click.stop="subOpen = !subOpen"
+    >{{ subOpen ? '▾' : '▸' }} 하위 폴더 {{ folder.children.length }}개</button>
+    <template v-if="subOpen">
+      <FolderCard
+        v-for="c in folder.children"
+        :key="c.id"
+        :folder="c"
+        nested
+        :show-sub="showSub"
+        @open="(p) => emit('open', p)"
+        @pdf="(d) => emit('pdf', d)"
+        @written="(r, m) => emit('written', r, m)"
+      />
+    </template>
   </div>
 </template>

@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { fetchTagGroups, loadTagRanks, type TagGroup } from '../api'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { fetchTagGroups, loadTagRanks, tagRanks, type TagGroup } from '../api'
 
 const props = defineProps<{ existing: string[]; anchor: DOMRect }>()
 const emit = defineEmits<{ pick: [tag: string]; close: [] }>()
@@ -10,13 +10,25 @@ const filter = ref('')
 const box = ref<HTMLInputElement | null>(null)
 const root = ref<HTMLElement | null>(null)
 
-const CATEGORIES = ['술식', '치식', '임플란트', '이식재', '차폐막', '기타']
+const BUILTIN_CATS = ['술식', '치식', '임플란트', '이식재', '차폐막', '기타']
+// 서버가 아는 사용자 정의 카테고리 포함
+const categories = computed(() => {
+  const names = new Set(BUILTIN_CATS.slice(0, -1))
+  groups.value.forEach((g) => names.add(g.name))
+  names.delete('기타')
+  return [...names, '기타']
+})
 const catMenu = ref<{ tag: string; count: number; x: number; y: number } | null>(null)
+
+// 새 태그 추가 등으로 tag_groups가 밖에서 갱신되면 열려 있는 피커도 즉시 반영
+watch(tagRanks, async () => {
+  groups.value = await fetchTagGroups()
+})
 
 function openCatMenu(e: MouseEvent, tag: string) {
   e.preventDefault()
   const count = groups.value.flatMap((g) => g.tags).find((t) => t.tag === tag)?.count ?? 0
-  const MENU_H = 270
+  const MENU_H = 320
   catMenu.value = {
     tag,
     count,
@@ -45,6 +57,12 @@ async function deleteTag() {
   } catch (e: any) {
     window.alert(`삭제 실패: ${e.message ?? e}`)
   }
+}
+
+async function newCategory() {
+  const name = window.prompt('새 카테고리 이름')?.trim()
+  if (name) await assignCategory(name)
+  else catMenu.value = null
 }
 
 async function assignCategory(cat: string) {
@@ -146,7 +164,8 @@ onUnmounted(() => document.removeEventListener('mousedown', onDocClick))
       @mouseleave="catMenu = null"
     >
       <div class="cat-menu-title">"{{ catMenu.tag }}" 카테고리</div>
-      <button v-for="c in CATEGORIES" :key="c" @click="assignCategory(c)">{{ c }}</button>
+      <button v-for="c in categories" :key="c" @click="assignCategory(c)">{{ c }}</button>
+      <button @click="newCategory">➕ 새 카테고리…</button>
       <div class="cat-menu-sep" />
       <button class="cat-menu-delete" @click="deleteTag">
         🗑 태그 삭제{{ catMenu.count ? ` (${catMenu.count}개 폴더 사용 중)` : '' }}

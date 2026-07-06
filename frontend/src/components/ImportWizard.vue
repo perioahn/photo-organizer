@@ -107,6 +107,36 @@ async function commit() {
   }
 }
 
+// 그룹 드래그 병합 (중복 촬영 등으로 묶음이 갈라졌을 때)
+const dragGid = ref<number | null>(null)
+const dropGid = ref<number | null>(null)
+
+async function mergeInto(dst: Group) {
+  const srcId = dragGid.value
+  dragGid.value = null
+  dropGid.value = null
+  if (srcId === null || srcId === dst.id || dst.unassigned) return
+  const src = groups.value.find((g) => g.id === srcId)
+  if (!src || src.unassigned) return
+  if (!window.confirm(`"${groupLabel(src)}"을(를)\n"${groupLabel(dst)}"에 합칠까요?`)) return
+  busy.value = true
+  try {
+    const res = await fetch('/api/import/merge', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ src: srcId, dst: dst.id }),
+    })
+    if (!res.ok) throw new Error((await res.json()).detail ?? '병합 실패')
+    session.value = await res.json()
+    selectedGid.value = null
+    await refresh()
+    msg.value = '묶음 병합됨'
+  } catch (e: any) {
+    msg.value = `병합 실패: ${e.message ?? e}`
+  } finally {
+    busy.value = false
+  }
+}
+
 async function discard() {
   if (!window.confirm('이 가져오기 세션을 폐기할까요? (원본 사진은 그대로 남습니다)')) return
   await fetch('/api/import/discard', { method: 'POST' })
@@ -179,7 +209,8 @@ onUnmounted(() => es?.close())
       <!-- 리뷰 -->
       <template v-else-if="session.status === 'review' || session.status === 'committing'">
         <p class="review-hint">
-          묶음을 검토하세요: 번호/이름/날짜 수정, 묶음 제외, 임상사진의 ✂로 묶음 분리.
+          묶음을 검토하세요: 번호/이름/날짜 수정, 묶음 제외, 임상사진의 ✂로 묶음 분리,
+          묶음을 드래그해 다른 묶음에 놓으면 병합.
           <span v-if="msg"> · {{ msg }}</span>
         </p>
         <div class="import-body">
@@ -188,8 +219,16 @@ onUnmounted(() => es?.close())
               v-for="g in groups"
               :key="g.id"
               class="import-group-item"
-              :class="{ active: g.id === selectedGid, off: !g.enabled }"
+              :class="{ active: g.id === selectedGid, off: !g.enabled,
+                        'drop-target': dropGid === g.id && dragGid !== g.id }"
+              :draggable="!g.unassigned"
+              :title="g.unassigned ? '' : '드래그해서 다른 묶음에 놓으면 병합'"
               @click="selectedGid = g.id"
+              @dragstart="dragGid = g.id"
+              @dragend="dragGid = null; dropGid = null"
+              @dragover.prevent="dropGid = g.id"
+              @dragleave="dropGid === g.id && (dropGid = null)"
+              @drop.prevent="mergeInto(g)"
             >
               <input type="checkbox" :checked="g.enabled" :disabled="g.unassigned"
                      @click.stop @change="patchGroup(g, { enabled: ($event.target as HTMLInputElement).checked })" />

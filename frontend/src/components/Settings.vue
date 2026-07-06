@@ -42,6 +42,31 @@ function removeSchedule(i: number) {
   scheduleFolders.value.splice(i, 1)
 }
 
+async function cleanupThumbnails() {
+  busy.value = true
+  msg.value = '구버전 썸네일 파일 검색 중…'
+  try {
+    const scan = await (await fetch('/api/cleanup_thumbnails', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dry_run: true }),
+    })).json()
+    if (!scan.found) { msg.value = '구버전 썸네일 파일 없음'; return }
+    if (!window.confirm(
+      `구버전 앱이 만든 썸네일 파일 ${scan.found}개(thumbnail_*.jpg)를 삭제할까요?\n` +
+      '원본 사진은 건드리지 않습니다. 이 삭제는 되돌릴 수 없습니다.')) { msg.value = ''; return }
+    msg.value = '삭제 중…'
+    const r = await (await fetch('/api/cleanup_thumbnails', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dry_run: false }),
+    })).json()
+    msg.value = `구버전 썸네일 ${r.deleted}/${r.found}개 삭제됨`
+  } catch (e: any) {
+    msg.value = `썸네일 정리 실패: ${e.message ?? e}`
+  } finally {
+    busy.value = false
+  }
+}
+
 async function save() {
   if (!photoRoot.value) {
     msg.value = '사진 폴더를 먼저 선택하세요'
@@ -97,6 +122,14 @@ onMounted(load)
         </div>
         <div v-if="scheduleFolders.length < 2" class="set-path">
           <button :disabled="busy" @click="changeSchedule(scheduleFolders.length)">+ 폴더 추가…</button>
+        </div>
+      </div>
+
+      <div v-if="!firstRun" class="set-row">
+        <label>🧹 유지 관리</label>
+        <div class="set-path">
+          <code>구버전 앱이 원본 옆에 만든 thumbnail_*.jpg 잔재 삭제</code>
+          <button :disabled="busy || !photoRoot" @click="cleanupThumbnails">정리…</button>
         </div>
       </div>
 

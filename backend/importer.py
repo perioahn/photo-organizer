@@ -185,7 +185,11 @@ def _scan(folder: str) -> None:
 
 
 def _rebuild_groups() -> None:
-    """items의 kind/순서 기준으로 그룹 재구성 (info가 새 그룹 시작)."""
+    """items의 kind/순서 기준으로 그룹 재구성 (info가 새 그룹 시작).
+
+    _session["merges"] = {src_info_idx: dst_info_idx} — 드래그 병합 기록.
+    재구성 후 src 그룹의 항목들을 dst 그룹으로 옮기고 src 그룹은 제거.
+    """
     with _lock:
         items = _session["items"]
         groups = []
@@ -203,6 +207,18 @@ def _rebuild_groups() -> None:
                 cur["item_idxs"].append(i)
             else:
                 unassigned["item_idxs"].append(i)
+        # 병합 적용 (info가 demote되면 그 병합 기록은 자연 소멸)
+        merges = {int(k): int(v) for k, v in (_session.get("merges") or {}).items()}
+        by_info = {g["info_idx"]: g for g in groups}
+        for src_i, dst_i in merges.items():
+            src_g, dst_g = by_info.get(src_i), by_info.get(dst_i)
+            if src_g is None or dst_g is None or src_g is dst_g:
+                continue
+            dst_g["item_idxs"] = sorted(dst_g["item_idxs"] + src_g["item_idxs"])
+            groups.remove(src_g)
+            by_info.pop(src_i)
+        for k, g in enumerate(groups):
+            g["id"] = k + 1
         for g in groups:
             clin = [items[i] for i in g["item_idxs"] if items[i]["kind"] == "clinical"]
             base = clin[0] if clin else items[g["info_idx"]]  # 날짜 = 첫 임상사진 (Codex 확정)
@@ -214,6 +230,25 @@ def _rebuild_groups() -> None:
             groups.insert(0, unassigned)
         _session["groups"] = groups
         _save()
+
+
+def merge_groups(src_gid: int, dst_gid: int) -> None:
+    """src 그룹을 dst로 병합 (드래그&드롭). 재구성 시에도 유지되게 merges에 기록."""
+    with _lock:
+        groups = _session["groups"]
+        src = next((g for g in groups if g["id"] == src_gid), None)
+        dst = next((g for g in groups if g["id"] == dst_gid), None)
+        if src is None or dst is None:
+            raise ValueError("그룹 없음")
+        if src is dst or src.get("unassigned") or dst.get("unassigned"):
+            raise ValueError("병합할 수 없는 그룹입니다")
+        merges = _session.setdefault("merges", {})
+        # src로 이미 병합된 그룹들도 함께 dst를 가리키게
+        for k, v in list(merges.items()):
+            if int(v) == src["info_idx"]:
+                merges[k] = dst["info_idx"]
+        merges[str(src["info_idx"])] = dst["info_idx"]
+        _rebuild_groups()
 
 
 def update_group(gid: int, fields: dict) -> dict:

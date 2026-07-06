@@ -12,6 +12,16 @@ CAT_ORDER = ["술식", "치식", "임플란트", "이식재", "차폐막", "기�
 _CAT_IDX = {c: i for i, c in enumerate(CAT_ORDER)}
 ETC_IDX = _CAT_IDX["기타"]
 
+
+def cat_order(cfg: dict) -> list[str]:
+    """내장 순서 + 사용자 정의 카테고리(기타 앞에 삽입)."""
+    custom = [c for c in cfg.get("super_categories", {}) if c not in _CAT_IDX]
+    return CAT_ORDER[:-1] + custom + ["기타"]
+
+
+def _cat_idx(cfg: dict) -> dict[str, int]:
+    return {c: i for i, c in enumerate(cat_order(cfg))}
+
 BRANDS = {"네오", "오스템", "덴티움", "스트라우만", "신흥"}
 GRAFTS = {"바이오오스", "바이오트리", "본트리", "인터오스", "오스테온"}
 MEMBRANES = {"바이오가이드", "티타늄메쉬", "ePTFE"}
@@ -59,15 +69,19 @@ def load_config(root: str) -> dict:
 
 def category_of(tag: str, cfg: dict) -> str:
     cat = (cfg.get("tags", {}).get(tag) or {}).get("super_category")
-    return cat if cat in _CAT_IDX else guess_category(tag)
+    if cat and (cat in _CAT_IDX or cat in cfg.get("super_categories", {})):
+        return cat
+    return guess_category(tag)
 
 
 def sort_tags(tags: list[str], cfg: dict) -> list[str]:
     """카테고리 순 + 치식 내부 순서. 그 외 카테고리 내부는 원래 순서 유지(stable)."""
+    idx = _cat_idx(cfg)
+    etc = idx["기타"]
     def key(item):
         i, t = item
         cat = category_of(t, cfg)
-        ci = _CAT_IDX.get(cat, ETC_IDX)
+        ci = idx.get(cat, etc)
         return (ci, tooth_key(t) if cat == "치식" else 0, i)
     return [t for _, t in sorted(enumerate(tags), key=lambda x: key(x))]
 
@@ -90,10 +104,12 @@ def save_config(root: str, cfg: dict) -> None:
 
 
 def set_category(root: str, tag: str, category: str | None) -> None:
-    """태그의 super_category 지정 (None = 기타). 구 앱과 같은 config 파일에 기록."""
-    if category is not None and category not in _CAT_IDX:
-        raise ValueError(f"알 수 없는 카테고리: {category}")
+    """태그의 super_category 지정 (None = 기타). 새 이름이면 사용자 카테고리로 등록."""
+    if category is not None and not category.strip():
+        raise ValueError("카테고리 이름이 비어 있습니다")
     cfg = load_config(root)
+    if category not in (None, "기타") and category not in _CAT_IDX:
+        cfg.setdefault("super_categories", {}).setdefault(category, {})
     entry = cfg.setdefault("tags", {}).setdefault(tag, {})
     entry["super_category"] = None if category in (None, "기타") else category
     save_config(root, cfg)

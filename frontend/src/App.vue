@@ -92,6 +92,22 @@ const sortedPatients = computed(() => {
   return [...patients.value].sort((a, b) => latestDate(b).localeCompare(latestDate(a)))
 })
 
+// 날짜순 = 촬영일 폴더의 평면 목록 (환자 묶음 없이 말 그대로 촬영일 역순)
+const flatFolders = computed(() => {
+  const out: { p: Patient; f: FolderNode }[] = []
+  for (const p of patients.value)
+    for (const f of p.folders) if (f.date6) out.push({ p, f })
+  return out.sort((a, b) =>
+    b.f.date6!.localeCompare(a.f.date6!) || a.p.name.localeCompare(b.p.name))
+})
+
+// 하위 폴더 표시 (사용자가 촬영일 폴더 안에 편집본/CT 폴더를 파는 경우) — 기본 접힘
+const showSub = ref(localStorage.getItem('showSub') === '1')
+function toggleSub() {
+  showSub.value = !showSub.value
+  localStorage.setItem('showSub', showSub.value ? '1' : '0')
+}
+
 async function load(q = query.value) {
   const seq = ++loadSeq // 늦게 도착한 이전 응답이 최신 결과를 덮지 않게
   loading.value = true
@@ -141,8 +157,14 @@ function openViewer(payload: { files: FileEntry[]; index: number; folder: Folder
   viewer.value = { ...payload, patient }
 }
 
-function scrollToPatient(id: number) {
-  document.getElementById(`patient-${id}`)?.scrollIntoView({ block: 'start' })
+function scrollToPatient(p: Patient) {
+  // 날짜순 평면 목록에는 환자 섹션이 없으니 검색으로 이동
+  if (sortMode.value === 'recent') {
+    query.value = p.num ?? p.name
+    load()
+    return
+  }
+  document.getElementById(`patient-${p.id}`)?.scrollIntoView({ block: 'start' })
 }
 
 function onKey(e: KeyboardEvent) {
@@ -212,7 +234,7 @@ function onViewerClose() {
           v-for="p in sortedPatients"
           :key="p.id"
           class="patient-item"
-          @click="scrollToPatient(p.id)"
+          @click="scrollToPatient(p)"
         >
           <span class="pname">{{ p.name }}</span>
           <span class="pnum">{{ p.num ?? '' }}</span>
@@ -230,6 +252,10 @@ function onViewerClose() {
         </button>
       </div>
       <div class="statusbar">
+        <button class="sub-global-toggle" :class="{ on: showSub }"
+                title="촬영일 폴더 안의 하위 폴더(편집본·CT 등) 표시" @click="toggleSub">
+          {{ showSub ? '▾' : '▸' }} 하위폴더
+        </button>
         <span v-if="loading">불러오는 중…</span>
         <span v-else-if="error" class="err">{{ error }}</span>
         <span v-else>{{ patients.length }}명 · 폴더 {{ totalFolders }} · {{ statusMsg }}</span>
@@ -241,32 +267,49 @@ function onViewerClose() {
       <div v-if="error" class="error-banner">
         {{ error }} <button @click="load()">재시도</button>
       </div>
-      <section
-        v-for="p in sortedPatients"
-        :id="`patient-${p.id}`"
-        :key="p.id"
-        class="patient-section"
-      >
-        <h2>
-          {{ p.name }} <span class="pnum">{{ p.num ?? p.folder_name }}</span>
-          <button
-            v-if="p.num"
-            class="icon-btn"
-            title="스케줄 PDF 열기 (최신)"
-            @click="openPdf(p.num)"
-          >📄</button>
-        </h2>
-        <div class="folders">
-          <FolderCard
-            v-for="f in p.folders"
-            :key="f.id"
-            :folder="f"
-            @open="(payload) => openViewer(payload, p)"
-            @pdf="(date6) => openPdf(p.num, date6)"
-            @written="onWritten"
-          />
-        </div>
-      </section>
+      <!-- 날짜순: 환자 묶음 없이 촬영일 역순 평면 목록 -->
+      <div v-if="sortMode === 'recent'" class="folders flat-by-date">
+        <FolderCard
+          v-for="e in flatFolders"
+          :key="e.f.id"
+          :folder="e.f"
+          :show-sub="showSub"
+          :patient-label="`${e.p.name} ${e.p.num ?? ''}`.trim()"
+          @open="(payload) => openViewer(payload, e.p)"
+          @pdf="(date6) => openPdf(e.p.num, date6)"
+          @written="onWritten"
+        />
+      </div>
+      <!-- 이름순: 기존 환자 섹션 -->
+      <template v-else>
+        <section
+          v-for="p in sortedPatients"
+          :id="`patient-${p.id}`"
+          :key="p.id"
+          class="patient-section"
+        >
+          <h2>
+            {{ p.name }} <span class="pnum">{{ p.num ?? p.folder_name }}</span>
+            <button
+              v-if="p.num"
+              class="icon-btn"
+              title="스케줄 PDF 열기 (최신)"
+              @click="openPdf(p.num)"
+            >📄</button>
+          </h2>
+          <div class="folders">
+            <FolderCard
+              v-for="f in p.folders"
+              :key="f.id"
+              :folder="f"
+              :show-sub="showSub"
+              @open="(payload) => openViewer(payload, p)"
+              @pdf="(date6) => openPdf(p.num, date6)"
+              @written="onWritten"
+            />
+          </div>
+        </section>
+      </template>
       <p v-if="!loading && !patients.length" class="empty">결과 없음</p>
     </main>
 
