@@ -218,7 +218,7 @@ function onViewerClose() {
         <input
           ref="searchBox"
           v-model="query"
-          placeholder="검색 (/ 로 포커스): 이름·번호·태그·#치식"
+          placeholder="검색 (/ 로 포커스): 이름·번호·태그·#치식·날짜(251020)"
           @input="onSearchInput"
           @keydown.escape.stop="clearSearch"
         />

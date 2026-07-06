@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -280,6 +281,21 @@ def search(q: str = "") -> list[dict]:
     conn = db.connect()
     if not q:
         return _folder_rows_to_tree(conn)
+
+    # 날짜 검색: 251020 / 20251020 / 2025-10-20 / 25.10.20 → 촬영일(date6) 일치
+    compact = re.sub(r"[-./\s]", "", q)
+    m = re.fullmatch(r"(?:20)?(\d{6})", compact)
+    if m:
+        date6 = m.group(1)
+        with db.lock:
+            ids = [r["patient_id"] for r in conn.execute(
+                "SELECT DISTINCT patient_id FROM folders WHERE date6=?", (date6,))]
+        if ids:  # 해당 날짜 촬영만 (다른 날짜 폴더는 제외), 없으면 일반 검색 폴백
+            tree = _folder_rows_to_tree(conn, ids)
+            for p in tree:
+                p["folders"] = [f for f in p["folders"] if f["date6"] == date6]
+            return [p for p in tree if p["folders"]]
+
     like = f"%{q}%"
     with db.lock:
         if q == "태그없음":
