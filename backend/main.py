@@ -150,6 +150,24 @@ def get_settings() -> dict:
             "root_ok": os.path.isdir(ROOT)}
 
 
+def _legacy_folder_dialog_ps(initial: str) -> list[str]:
+    """구형 FolderBrowserDialog 인라인 명령 (ps1 스크립트가 없을 때 폴백)."""
+    ps = (
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+        "Add-Type -AssemblyName System.Windows.Forms;"
+        "$f = New-Object System.Windows.Forms.FolderBrowserDialog;"
+        "$f.Description = '폴더 선택';"
+    )
+    if initial and os.path.isdir(initial) and "'" not in initial:
+        ps += f"$f.SelectedPath = '{initial}';"
+    ps += (
+        "$top = New-Object System.Windows.Forms.Form -Property @{TopMost=$true; "
+        "WindowState='Minimized'; ShowInTaskbar=$false};"
+        "if ($f.ShowDialog($top) -eq 'OK') { Write-Output $f.SelectedPath }"
+    )
+    return ["powershell", "-STA", "-NoProfile", "-Command", ps]
+
+
 @app.post("/api/select_folder")
 def select_folder(initial: str = Body(default="", embed=True)) -> dict:
     """서버(로컬 PC)에서 네이티브 폴더 선택 다이얼로그 표시 (Windows/macOS)."""
@@ -162,15 +180,20 @@ def select_folder(initial: str = Body(default="", embed=True)) -> dict:
             path = r.stdout.decode("utf-8", "replace").strip().rstrip("/")
         else:
             script = os.path.join(os.path.dirname(__file__), "folder_dialog.ps1")
-            args = ["powershell", "-STA", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                    "-File", script]
-            if initial and os.path.isdir(initial):
-                args += ["-Initial", initial]
+            if os.path.isfile(script):
+                args = ["powershell", "-STA", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", script]
+                if initial and os.path.isdir(initial):
+                    args += ["-Initial", initial]
+            else:  # exe 번들 누락 등 — 구형 다이얼로그로 동작은 보장
+                args = _legacy_folder_dialog_ps(initial)
             r = subprocess.run(args, capture_output=True, timeout=300)
             path = r.stdout.decode("utf-8", "replace").strip()
     except (OSError, subprocess.TimeoutExpired):
         raise HTTPException(500, "폴더 선택 다이얼로그 실패")
-    return {"path": path or None}
+    # PowerShell 배너/에러 텍스트가 경로로 새지 않게 — 실제 폴더일 때만 채택
+    path = path.splitlines()[-1].strip() if path else ""
+    return {"path": path if os.path.isdir(path) else None}
 
 
 @app.post("/api/settings")
