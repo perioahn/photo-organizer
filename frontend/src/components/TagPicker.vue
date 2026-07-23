@@ -28,7 +28,7 @@ watch(tagRanks, async () => {
 function openCatMenu(e: MouseEvent, tag: string) {
   e.preventDefault()
   const count = groups.value.flatMap((g) => g.tags).find((t) => t.tag === tag)?.count ?? 0
-  const MENU_H = 320
+  const MENU_H = 390
   catMenu.value = {
     tag,
     count,
@@ -56,6 +56,54 @@ async function deleteTag() {
     loadTagRanks(true).catch(() => {})
   } catch (e: any) {
     window.alert(`삭제 실패: ${e.message ?? e}`)
+  }
+}
+
+function findTag(name: string) {
+  return groups.value.flatMap((g) => g.tags).find((t) => t.tag === name)
+}
+
+async function callRename(oldTag: string, newTag: string) {
+  const res = await fetch('/api/tag_rename', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tag: oldTag, new: newTag }),
+  })
+  if (!res.ok) throw new Error((await res.json()).detail ?? `HTTP ${res.status}`)
+  groups.value = await fetchTagGroups(true)
+  loadTagRanks(true).catch(() => {})
+}
+
+async function renameTag() {
+  const m = catMenu.value
+  catMenu.value = null
+  if (!m) return
+  const input = window.prompt('새 태그 이름', m.tag)?.trim()
+  if (!input || input === m.tag) return
+  if (findTag(input) &&
+      !window.confirm(`이미 있는 태그입니다. "${m.tag}"를 "${input}"에 합칠까요? (${m.count}개 폴더 반영)`)) return
+  try {
+    await callRename(m.tag, input)
+  } catch (e: any) {
+    window.alert(`이름 변경 실패: ${e.message ?? e}`)
+  }
+}
+
+async function mergeTag() {
+  const m = catMenu.value
+  catMenu.value = null
+  if (!m) return
+  const input = window.prompt('합칠 대상 태그 이름')?.trim()
+  if (!input || input === m.tag) return
+  if (!findTag(input)) {
+    window.alert(`"${input}" 태그가 없습니다`)
+    return
+  }
+  if (!window.confirm(`${m.count}개 폴더에서 "${m.tag}"를 "${input}"로 합칩니다`)) return
+  try {
+    await callRename(m.tag, input)
+  } catch (e: any) {
+    window.alert(`합치기 실패: ${e.message ?? e}`)
   }
 }
 
@@ -166,6 +214,9 @@ onUnmounted(() => document.removeEventListener('mousedown', onDocClick))
       <div class="cat-menu-title">"{{ catMenu.tag }}" 카테고리</div>
       <button v-for="c in categories" :key="c" @click="assignCategory(c)">{{ c }}</button>
       <button @click="newCategory">➕ 새 카테고리…</button>
+      <div class="cat-menu-sep" />
+      <button @click="renameTag">✏ 이름 변경…</button>
+      <button @click="mergeTag">⇄ 다른 태그에 합치기…</button>
       <div class="cat-menu-sep" />
       <button class="cat-menu-delete" @click="deleteTag">
         🗑 태그 삭제{{ catMenu.count ? ` (${catMenu.count}개 폴더 사용 중)` : '' }}

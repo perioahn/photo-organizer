@@ -236,6 +236,97 @@ def delete_tag(root: str, tag: str) -> dict:
     return {"tag": tag, "removed_from": len(renames_disk), "skipped": skipped, "run_id": run_id}
 
 
+def rename_tag(root: str, old: str, new: str) -> dict:
+    """태그 이름 변경. new가 이미 있는 태그면 병합(폴더 내 중복 제거). 저널 1건으로 undo."""
+    old = (old or "").strip()
+    new = (new or "").strip()
+    if not old or old.startswith("@"):
+        raise WriteError("상태라벨(@)은 이름을 바꿀 수 없습니다")
+    if not new or new.startswith("@"):
+        raise WriteError("새 이름이 비었거나 @로 시작합니다")
+    if "_" in new:
+        raise WriteError("태그에 밑줄(_) 불가 — 폴더명 구분자입니다")
+    if INVALID_CHARS.search(new):
+        raise WriteError('태그에 금지 문자 (<>:"/\\|?*) 포함')
+    if new == old:
+        raise WriteError("이름이 같습니다")
+    conn = db.connect()
+    renames_disk: list[list[str]] = []
+    skipped: list[str] = []
+    n_folders = 0
+    with write_lock, db.fs_lock, db.ProcessLock():
+        with db.lock:
+            rows = conn.execute(
+                """SELECT f.id, f.name, f.date6, f2.name AS parent_name,
+                          p.folder_name AS patient_folder
+                   FROM folders f
+                   JOIN tags t ON t.folder_id = f.id AND t.tag = ?
+                   LEFT JOIN folders f2 ON f2.id = f.parent_id
+                   JOIN patients p ON p.id = f.patient_id""",
+                (old,),
+            ).fetchall()
+            new_used = conn.execute("SELECT 1 FROM tags WHERE tag=? LIMIT 1", (new,)).fetchone()
+        cfg = tagsort.load_config(root)
+        tags_cfg = cfg.setdefault("tags", {})
+        if old not in tags_cfg and not rows:
+            raise WriteError(f"태그 '{old}'가 없습니다")
+        merged = new in tags_cfg or new_used is not None
+        old_cat = tagsort.category_of(old, cfg)  # pop 전에 — 카테고리 계승용
+        old_entry = tags_cfg.pop(old, None)
+        if not merged:
+            # 새 이름이 old의 카테고리를 계승 (정렬·피커 그룹 유지)
+            tags_cfg[new] = old_entry or {
+                "super_category": None if old_cat == "기타" else old_cat}
+        for r in rows:
+            _, tags = scanner.parse_b_folder(r["name"])
+            if old not in tags:
+                continue
+            tags = list(dict.fromkeys(new if t == old else t for t in tags))  # 병합 시 중복 제거
+            status = [t for t in tags if t.startswith("@")]
+            rest = tagsort.sort_tags([t for t in tags if not t.startswith("@")], cfg)
+            new_name = r["date6"] + ("_" + "_".join(status + rest) if (status + rest) else "")
+            if new_name == r["name"]:
+                continue
+            parts = [r["patient_folder"]] + ([r["parent_name"]] if r["parent_name"] else [])
+            old_path = os.path.join(root, *parts, r["name"])
+            new_path = os.path.join(root, *parts, new_name)
+            case_only = old_path.lower() == new_path.lower()  # Windows FS는 대소문자 무시
+            if not os.path.isdir(old_path) or (os.path.exists(new_path) and not case_only):
+                skipped.append(r["name"])
+                continue
+            if case_only:
+                # 같은 디렉터리라 직접 rename 불가 — dot 임시명 경유 (스캐너가 무시)
+                tmp_path = os.path.join(root, *parts, "." + new_name)
+                _rename_with_retry(old_path, tmp_path)
+                _rename_with_retry(tmp_path, new_path)
+                renames_disk += [[old_path, tmp_path], [tmp_path, new_path]]
+            else:
+                _rename_with_retry(old_path, new_path)
+                renames_disk.append([old_path, new_path])
+            n_folders += 1
+            date6, new_tags = scanner.parse_b_folder(new_name)
+            with db.lock:
+                conn.execute("UPDATE folders SET name=? WHERE id=?", (new_name, r["id"]))
+                conn.execute("DELETE FROM tags WHERE folder_id=?", (r["id"],))
+                conn.executemany(
+                    "INSERT INTO tags(folder_id, tag, position) VALUES(?,?,?)",
+                    [(r["id"], t, i) for i, t in enumerate(new_tags)],
+                )
+                conn.commit()
+        run_id = None
+        if renames_disk:
+            run_id = _write_journal({"kind": "rename_tag", "old": old, "new": new,
+                                     "renames": renames_disk})
+        if old_entry is not None or not merged:
+            tagsort.save_config(root, cfg)
+    events.publish("folder", {"state": "tag_renamed", "old": old, "new": new,
+                              "merged": merged, "renamed": n_folders, "run_id": run_id})
+    log.info("rename tag %s -> %s (merged=%s): %d folders, %d skipped",
+             old, new, merged, n_folders, len(skipped))
+    return {"tag": old, "new": new, "merged": merged, "renamed_folders": n_folders,
+            "skipped": skipped, "run_id": run_id}
+
+
 def undo(root: str, run_id: str) -> dict:
     """저널 역순 리네임. 현 위치에 있고 원래 이름이 비어있을 때만."""
     path = os.path.join(journal_dir(), f"run_{run_id}.json")

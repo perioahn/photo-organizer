@@ -404,6 +404,13 @@ async def tag_delete(tag: str = Body(embed=True)) -> dict:
     return await asyncio.to_thread(_write, writer.delete_tag, ROOT, tag)
 
 
+@app.post("/api/tag_rename")
+async def tag_rename(tag: str = Body(embed=True), new: str = Body(embed=True)) -> dict:
+    """태그 이름 변경 — new가 기존 태그면 병합 (저널로 undo 가능)."""
+    require_root()
+    return await asyncio.to_thread(_write, writer.rename_tag, ROOT, tag, new)
+
+
 @app.get("/api/folder/{folder_id}/files")
 def folder_files(folder_id: int) -> list[dict]:
     conn = db.connect()
