@@ -41,7 +41,9 @@ def get_session() -> dict | None:
             except (OSError, ValueError):
                 _session = None
             if _session and _session.get("status") == "review":
-                _rebuild_groups()  # 재로딩 시 자동 이름 재해석 (규칙 개선분 반영)
+                for _k in ("name_cache", "name_cache_v3"):
+                    _session.pop(_k, None)  # 이전 규칙의 오인 결과 폐기
+                _rebuild_groups()  # 재로딩 시 자동 이름 재해석
         return _session
 
 
@@ -122,48 +124,83 @@ def lookup_name(num: str) -> str | None:
 _NAME_STOP = {"원장", "치과", "선생님", "위생사", "실장", "진료번호", "환자명", "환자",
               "이름", "번호", "차트", "예약", "접수", "수납", "메모", "시간", "오전", "오후",
               "보험", "일반", "공통", "초진", "재진", "신환", "구환", "스케일링", "임플란트",
-              "발치", "크라운", "브릿지", "체크", "소독", "수정"}  # 번호 근처 머리글·비이름 토큰
+              "발치", "크라운", "브릿지", "체크", "소독", "수정", "수진자명", "생년월일",
+              "진료의", "담당의", "주치의", "메모사항", "성명"}  # 번호 근처 머리글·비이름 토큰
 
 
-def _nearest_name(text: str, num: str) -> str | None:
-    """텍스트에서 num 주변 ±40자 내 가장 가까운 한글 2~4자 토큰 (머리글 제외)."""
+def _nearest_name(text: str, num: str, max_dist: int = 40) -> str | None:
+    """텍스트에서 num 주변 가장 가까운 한글 2~4자 토큰 (머리글 제외, max_dist 이내)."""
     best = None
     for m in re.finditer(num, text):
-        lo = max(0, m.start() - 40)
-        for t in re.finditer(r"[가-힣]{2,4}", text[lo:m.end() + 40]):
+        lo = max(0, m.start() - max_dist)
+        for t in re.finditer(r"[가-힣]{2,4}", text[lo:m.end() + max_dist]):
             if t.group() in _NAME_STOP:
                 continue
             pos = lo + t.start()
             dist = m.start() - (lo + t.end()) if pos < m.start() else pos - m.end()
+            if dist > max_dist:
+                continue
             if best is None or dist < best[0]:
                 best = (dist, t.group())
     return best[1] if best else None
 
 
 def name_from_schedule(num: str) -> str | None:
-    """일정표 PDF에서 번호 주변 한글 토큰으로 이름 추정 (인덱스에 없는 신규 환자용).
+    """일정표 PDF에서 진료번호로 이름 조회 — 라벨 증거 전용 (코덱스 확정안).
 
-    번호가 등장하는 페이지(최대 5)를 열어 ±40자 내 가장 가까운 한글 2~4자 토큰을
-    다수결로 채택. ponytail: 표 구조 파싱 없는 근접 휴리스틱 — 오탐은 UI에서 수정.
+    번호가 등장하는 페이지에서 '수진자명:' 류 라벨 바로 뒤 단어만 증거로 수집.
+    거리 기반 추측은 라벨('진료번호'·'수진자명')이나 의사 이름('진료의: …')을
+    이름으로 오인한 실사고 2회로 폐기 — 증거가 없거나 문서 간 상충하면 None(NA).
     """
     conn = db.connect()
     with db.lock:
         rows = conn.execute(
             """SELECT d.path, h.page FROM pdf_hits h JOIN pdfs d ON d.id = h.pdf_id
-               WHERE h.patient_num = ? ORDER BY d.date8 DESC LIMIT 5""",
+               WHERE h.patient_num = ? ORDER BY d.date8 DESC LIMIT 8""",
             (num,)).fetchall()
-    votes: dict[str, int] = {}
+    evidence: dict[str, set] = {}  # 이름 -> {pdf path}
     for r in rows:
         try:
             import fitz
             with fitz.open(r["path"]) as doc:
-                text = doc[r["page"] - 1].get_text()
+                words = doc[r["page"] - 1].get_text("words")
         except Exception:
             continue
-        n = _nearest_name(text, num)
-        if n:
-            votes[n] = votes.get(n, 0) + 1
-    return max(votes, key=votes.get) if votes else None
+        for n in _label_names(words, num):
+            evidence.setdefault(n, set()).add(r["path"])
+    if len(evidence) == 1:  # 상충 없이 하나로 수렴할 때만 채택
+        return next(iter(evidence))
+    return None
+
+
+_NAME_LABELS = ("수진자명", "환자성명", "환자명", "성명")
+
+
+def _plausible_name(t: str) -> bool:
+    return bool(re.fullmatch(r"[가-힣]{2,6}", t)) and t not in _NAME_STOP
+
+
+def _label_names(words: list, num: str) -> set[str]:
+    """번호가 있는 줄에서 이름 라벨 바로 뒤 단어만 수집.
+
+    실측 형식: `진료번호: 12505169 || 수진자명: 노병희|| 생년월일: … 진료의: 안현성||`
+    """
+    out: set[str] = set()
+    for w in words:
+        if num not in w[4]:
+            continue
+        cy = (w[1] + w[3]) / 2
+        h = max(w[3] - w[1], 1)
+        line = sorted((x for x in words if abs((x[1] + x[3]) / 2 - cy) < h * 0.6),
+                      key=lambda x: x[0])
+        toks = [re.sub(r"[^가-힣]", "", x[4]) for x in line]
+        for i, t in enumerate(toks):
+            for lab in _NAME_LABELS:
+                if t == lab and i + 1 < len(toks) and _plausible_name(toks[i + 1]):
+                    out.add(toks[i + 1])
+                elif t.startswith(lab) and _plausible_name(t[len(lab):]):
+                    out.add(t[len(lab):])  # '수진자명홍길동' 붙은 추출 대응
+    return out
 
 
 def _resolve_name(num: str | None, ocr_text: str | None = None) -> tuple[str | None, str | None]:
@@ -174,10 +211,10 @@ def _resolve_name(num: str | None, ocr_text: str | None = None) -> tuple[str | N
     if n:
         return n, "index"
     if ocr_text:
-        n = _nearest_name(ocr_text, num)
+        n = _nearest_name(ocr_text, num, max_dist=10)  # 차트화면 '번호 / 이름' 인접만
         if n:
             return n, "ocr"
-    cache = _session.setdefault("name_cache", {}) if _session is not None else {}
+    cache = _session.setdefault("name_cache_v3", {}) if _session is not None else {}
     if num in cache:
         n = cache[num]
     else:
