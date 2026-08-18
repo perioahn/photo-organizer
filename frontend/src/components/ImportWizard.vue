@@ -214,7 +214,7 @@ async function discard() {
 
 function groupLabel(g: Group): string {
   if (g.unassigned) return `⚠ 미분류 (${g.item_idxs.length}장)`
-  const who = g.num ? `${g.num}${g.name ? '_' + g.name : ''}` : '번호 미인식'
+  const who = g.num ? `${g.num}_${g.name || 'NA'}` : '번호 미인식'
   return `${g.date6 ?? '??'} · ${who} · ${g.item_idxs.length}장`
 }
 
@@ -330,6 +330,7 @@ onUnmounted(() => es?.close())
                 ⚠ 기존 환자 없음 — 번호를 확인하세요 (신규 환자면 이름 입력)
               </span>
               <span v-if="selected.name_source === 'schedule'" class="known-badge">📅 일정표에서 찾음</span>
+              <span v-else-if="selected.name_source === 'session'" class="known-badge">🔗 같은 목록에서 찾음</span>
             </div>
             <div class="import-thumbs">
               <div v-for="i in selected.item_idxs" :key="i" class="import-thumb"

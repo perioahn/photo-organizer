@@ -349,8 +349,19 @@ def update_group(gid: int, fields: dict) -> dict:
                 g[k] = fields[k]
         if fields.get("name"):
             g["name_source"] = None  # 직접 입력 — 자동 추정 아님
+            # 같은 세션의 동일 진료번호 그룹(다른 날짜 등)에도 이름 전파
+            if g.get("num"):
+                for o in _session["groups"]:
+                    if o is not g and o.get("num") == g["num"] and not o.get("name")                             and not o.get("unassigned"):
+                        o["name"], o["name_source"] = g["name"], "session"
+                        _persist_group(o)
         elif fields.get("num") and fields["num"] != num_before:
             known, src = _resolve_name(fields["num"])
+            if not known:  # 인덱스·일정표에 없어도 같은 세션에 이름 있으면 채용
+                other = next((o for o in _session["groups"]
+                              if o is not g and o.get("num") == fields["num"] and o.get("name")), None)
+                if other:
+                    known, src = other["name"], "session"
             if known:
                 g["name"], g["name_source"] = known, src
         _persist_group(g)
