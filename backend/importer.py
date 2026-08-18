@@ -40,6 +40,8 @@ def get_session() -> dict | None:
                     _session = json.load(f)
             except (OSError, ValueError):
                 _session = None
+            if _session and _session.get("status") == "review":
+                _rebuild_groups()  # 재로딩 시 자동 이름 재해석 (규칙 개선분 반영)
         return _session
 
 
@@ -117,7 +119,25 @@ def lookup_name(num: str) -> str | None:
     return r["patient_name"] if r else None
 
 
-_NAME_STOP = {"원장", "치과", "선생님", "위생사", "실장"}  # 번호 근처에 흔한 비이름 토큰
+_NAME_STOP = {"원장", "치과", "선생님", "위생사", "실장", "진료번호", "환자명", "환자",
+              "이름", "번호", "차트", "예약", "접수", "수납", "메모", "시간", "오전", "오후",
+              "보험", "일반", "공통", "초진", "재진", "신환", "구환", "스케일링", "임플란트",
+              "발치", "크라운", "브릿지", "체크", "소독", "수정"}  # 번호 근처 머리글·비이름 토큰
+
+
+def _nearest_name(text: str, num: str) -> str | None:
+    """텍스트에서 num 주변 ±40자 내 가장 가까운 한글 2~4자 토큰 (머리글 제외)."""
+    best = None
+    for m in re.finditer(num, text):
+        lo = max(0, m.start() - 40)
+        for t in re.finditer(r"[가-힣]{2,4}", text[lo:m.end() + 40]):
+            if t.group() in _NAME_STOP:
+                continue
+            pos = lo + t.start()
+            dist = m.start() - (lo + t.end()) if pos < m.start() else pos - m.end()
+            if best is None or dist < best[0]:
+                best = (dist, t.group())
+    return best[1] if best else None
 
 
 def name_from_schedule(num: str) -> str | None:
@@ -140,29 +160,29 @@ def name_from_schedule(num: str) -> str | None:
                 text = doc[r["page"] - 1].get_text()
         except Exception:
             continue
-        for m in re.finditer(num, text):
-            lo = max(0, m.start() - 40)
-            best = None
-            for t in re.finditer(r"[가-힣]{2,4}", text[lo:m.end() + 40]):
-                if t.group() in _NAME_STOP:
-                    continue
-                pos = lo + t.start()
-                dist = m.start() - (lo + t.end()) if pos < m.start() else pos - m.end()
-                if best is None or dist < best[0]:
-                    best = (dist, t.group())
-            if best:
-                votes[best[1]] = votes.get(best[1], 0) + 1
+        n = _nearest_name(text, num)
+        if n:
+            votes[n] = votes.get(n, 0) + 1
     return max(votes, key=votes.get) if votes else None
 
 
-def _resolve_name(num: str | None) -> tuple[str | None, str | None]:
-    """(이름, 출처) — patients 인덱스 우선, 없으면 일정표 PDF에서 추정."""
+def _resolve_name(num: str | None, ocr_text: str | None = None) -> tuple[str | None, str | None]:
+    """(이름, 출처) — 인덱스 > 정보사진 OCR(차트화면에 이름 표기) > 일정표 PDF(캐시)."""
     if not num:
         return None, None
     n = lookup_name(num)
     if n:
         return n, "index"
-    n = name_from_schedule(num)
+    if ocr_text:
+        n = _nearest_name(ocr_text, num)
+        if n:
+            return n, "ocr"
+    cache = _session.setdefault("name_cache", {}) if _session is not None else {}
+    if num in cache:
+        n = cache[num]
+    else:
+        n = name_from_schedule(num)
+        cache[num] = n
     return (n, "schedule") if n else (None, None)
 
 
@@ -252,10 +272,10 @@ def _rebuild_groups() -> None:
             if it["kind"] == "info":
                 it.pop("grp", None)  # 정보사진은 항상 자기 그룹 소속
                 ed = it.get("edit")
-                if ed:
-                    name, name_src = ed.get("name"), ed.get("name_source")
+                if ed and ed.get("name") and ed.get("name_source") in (None, "session"):
+                    name, name_src = ed["name"], ed.get("name_source")  # 사람 입력만 보존
                 else:
-                    name, name_src = _resolve_name(it["num"])
+                    name, name_src = _resolve_name(it["num"], it.get("ocr_text"))
                 cur = {"id": len(groups) + 1, "key": i, "num": it["num"],
                        "name": name, "name_source": name_src,
                        "date6": None, "enabled": ed.get("enabled", True) if ed else True,
@@ -356,7 +376,9 @@ def update_group(gid: int, fields: dict) -> dict:
                         o["name"], o["name_source"] = g["name"], "session"
                         _persist_group(o)
         elif fields.get("num") and fields["num"] != num_before:
-            known, src = _resolve_name(fields["num"])
+            ocr = (_session["items"][g["info_idx"]].get("ocr_text")
+                   if g.get("info_idx") is not None else None)
+            known, src = _resolve_name(fields["num"], ocr)
             if not known:  # 인덱스·일정표에 없어도 같은 세션에 이름 있으면 채용
                 other = next((o for o in _session["groups"]
                               if o is not g and o.get("num") == fields["num"] and o.get("name")), None)
