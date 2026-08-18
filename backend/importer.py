@@ -117,6 +117,55 @@ def lookup_name(num: str) -> str | None:
     return r["patient_name"] if r else None
 
 
+_NAME_STOP = {"원장", "치과", "선생님", "위생사", "실장"}  # 번호 근처에 흔한 비이름 토큰
+
+
+def name_from_schedule(num: str) -> str | None:
+    """일정표 PDF에서 번호 주변 한글 토큰으로 이름 추정 (인덱스에 없는 신규 환자용).
+
+    번호가 등장하는 페이지(최대 5)를 열어 ±40자 내 가장 가까운 한글 2~4자 토큰을
+    다수결로 채택. ponytail: 표 구조 파싱 없는 근접 휴리스틱 — 오탐은 UI에서 수정.
+    """
+    conn = db.connect()
+    with db.lock:
+        rows = conn.execute(
+            """SELECT d.path, h.page FROM pdf_hits h JOIN pdfs d ON d.id = h.pdf_id
+               WHERE h.patient_num = ? ORDER BY d.date8 DESC LIMIT 5""",
+            (num,)).fetchall()
+    votes: dict[str, int] = {}
+    for r in rows:
+        try:
+            import fitz
+            with fitz.open(r["path"]) as doc:
+                text = doc[r["page"] - 1].get_text()
+        except Exception:
+            continue
+        for m in re.finditer(num, text):
+            lo = max(0, m.start() - 40)
+            best = None
+            for t in re.finditer(r"[가-힣]{2,4}", text[lo:m.end() + 40]):
+                if t.group() in _NAME_STOP:
+                    continue
+                pos = lo + t.start()
+                dist = m.start() - (lo + t.end()) if pos < m.start() else pos - m.end()
+                if best is None or dist < best[0]:
+                    best = (dist, t.group())
+            if best:
+                votes[best[1]] = votes.get(best[1], 0) + 1
+    return max(votes, key=votes.get) if votes else None
+
+
+def _resolve_name(num: str | None) -> tuple[str | None, str | None]:
+    """(이름, 출처) — patients 인덱스 우선, 없으면 일정표 PDF에서 추정."""
+    if not num:
+        return None, None
+    n = lookup_name(num)
+    if n:
+        return n, "index"
+    n = name_from_schedule(num)
+    return (n, "schedule") if n else (None, None)
+
+
 def _date6(ts: float) -> str:
     return time.strftime("%y%m%d", time.localtime(ts))
 
@@ -188,21 +237,33 @@ def _rebuild_groups() -> None:
     """items의 kind/순서 기준으로 그룹 재구성 (info가 새 그룹 시작).
 
     _session["merges"] = {src_info_idx: dst_info_idx} — 드래그 병합 기록.
-    재구성 후 src 그룹의 항목들을 dst 그룹으로 옮기고 src 그룹은 제거.
+    _session["manual_groups"] = [{key:"m1", ...}] — ➕ 새 묶음 (빈 그룹도 유지).
+    항목의 "grp" = 드래그 이동 override (파생 그룹 key=info_idx, 수동 "m<n>", 미분류 "u").
+    항목의 "edit" = 사용자가 수정한 그룹 필드 (재구성 후에도 유지, update_group이 기록).
     """
     with _lock:
         items = _session["items"]
         groups = []
         cur = None
-        unassigned = {"id": 0, "num": None, "name": None, "date6": None, "enabled": False,
-                      "info_idx": None, "item_idxs": [], "unassigned": True}
+        moved = []  # (item_idx, target_key)
+        unassigned = {"id": 0, "key": "u", "num": None, "name": None, "date6": None,
+                      "enabled": False, "info_idx": None, "item_idxs": [], "unassigned": True}
         for i, it in enumerate(items):
             if it["kind"] == "info":
-                cur = {"id": len(groups) + 1, "num": it["num"],
-                       "name": lookup_name(it["num"]) if it["num"] else None,
-                       "date6": None, "enabled": True, "info_idx": i, "item_idxs": [i],
+                it.pop("grp", None)  # 정보사진은 항상 자기 그룹 소속
+                ed = it.get("edit")
+                if ed:
+                    name, name_src = ed.get("name"), ed.get("name_source")
+                else:
+                    name, name_src = _resolve_name(it["num"])
+                cur = {"id": len(groups) + 1, "key": i, "num": it["num"],
+                       "name": name, "name_source": name_src,
+                       "date6": None, "enabled": ed.get("enabled", True) if ed else True,
+                       "info_idx": i, "item_idxs": [i],
                        "unassigned": False}
                 groups.append(cur)
+            elif it.get("grp") is not None:
+                moved.append((i, it["grp"]))
             elif cur is not None:
                 cur["item_idxs"].append(i)
             else:
@@ -217,15 +278,39 @@ def _rebuild_groups() -> None:
             dst_g["item_idxs"] = sorted(dst_g["item_idxs"] + src_g["item_idxs"])
             groups.remove(src_g)
             by_info.pop(src_i)
-        for k, g in enumerate(groups):
-            g["id"] = k + 1
         for g in groups:
+            ed = items[g["info_idx"]].get("edit") or {}
             clin = [items[i] for i in g["item_idxs"] if items[i]["kind"] == "clinical"]
             base = clin[0] if clin else items[g["info_idx"]]  # 날짜 = 첫 임상사진 (Codex 확정)
-            g["date6"] = _date6(base["ts"])
+            g["date6"] = ed.get("date6") or _date6(base["ts"])
             if not clin:
                 g["enabled"] = False  # 연속 정보사진 등 임상 없는 묶음 = 기본 제외
+        # 수동 그룹 실체화 (빈 그룹도 표시) — 날짜는 자동 추정 없이 사용자 입력만
+        for mg in _session.get("manual_groups") or []:
+            groups.append({"id": 0, "key": mg["key"], "num": mg.get("num"),
+                           "name": mg.get("name"), "name_source": mg.get("name_source"),
+                           "date6": mg.get("date6"), "enabled": mg.get("enabled", True),
+                           "info_idx": None, "item_idxs": [], "unassigned": False,
+                           "manual": True})
+        # 이동 override 적용 — 대상이 병합됐으면 따라가고, 사라졌으면 폐기(미분류로)
+        by_key = {g["key"]: g for g in groups}
+        by_key["u"] = unassigned
+        for i, tkey in moved:
+            seen = set()
+            while isinstance(tkey, int) and tkey in merges and tkey not in seen:
+                seen.add(tkey)
+                tkey = merges[tkey]
+            g = by_key.get(tkey)
+            if g is None:
+                items[i].pop("grp", None)
+                g = unassigned
+            g["item_idxs"].append(i)
+        for g in groups:
+            g["item_idxs"].sort()
+        for k, g in enumerate(groups):
+            g["id"] = k + 1
         if unassigned["item_idxs"]:
+            unassigned["item_idxs"].sort()
             unassigned["date6"] = _date6(items[unassigned["item_idxs"][0]]["ts"])
             groups.insert(0, unassigned)
         _session["groups"] = groups
@@ -242,6 +327,8 @@ def merge_groups(src_gid: int, dst_gid: int) -> None:
             raise ValueError("그룹 없음")
         if src is dst or src.get("unassigned") or dst.get("unassigned"):
             raise ValueError("병합할 수 없는 그룹입니다")
+        if src.get("manual") or dst.get("manual"):
+            raise ValueError("수동 묶음은 병합 대신 사진을 드래그해 옮기세요")
         merges = _session.setdefault("merges", {})
         # src로 이미 병합된 그룹들도 함께 dst를 가리키게
         for k, v in list(merges.items()):
@@ -256,15 +343,60 @@ def update_group(gid: int, fields: dict) -> dict:
         g = next((g for g in _session["groups"] if g["id"] == gid), None)
         if g is None:
             raise ValueError("그룹 없음")
+        num_before = g.get("num")
         for k in ("num", "name", "date6", "enabled"):
             if k in fields and fields[k] is not None:
                 g[k] = fields[k]
-        if "num" in fields and fields["num"] and not fields.get("name"):
-            known = lookup_name(fields["num"])
+        if fields.get("name"):
+            g["name_source"] = None  # 직접 입력 — 자동 추정 아님
+        elif fields.get("num") and fields["num"] != num_before:
+            known, src = _resolve_name(fields["num"])
             if known:
-                g["name"] = known
+                g["name"], g["name_source"] = known, src
+        _persist_group(g)
         _save()
         return g
+
+
+def _persist_group(g: dict) -> None:
+    """그룹 편집을 재구성 원본(items/manual_groups)에 반영 — rebuild 후에도 유지."""
+    if g.get("unassigned"):
+        return
+    if g.get("manual"):
+        mg = next((m for m in _session.get("manual_groups") or [] if m["key"] == g["key"]), None)
+        if mg:
+            for k in ("num", "name", "name_source", "date6", "enabled"):
+                mg[k] = g.get(k)
+    elif g.get("info_idx") is not None:
+        it = _session["items"][g["info_idx"]]
+        it["num"] = g.get("num")
+        it["edit"] = {"name": g.get("name"), "name_source": g.get("name_source"),
+                      "date6": g.get("date6"), "enabled": g.get("enabled")}
+
+
+def move_item(idx: int, gid: int) -> None:
+    """드래그&드롭: 사진(임상)을 다른 그룹으로 이동 — items[idx]["grp"] override."""
+    with _lock:
+        items = _session["items"]
+        if not (0 <= idx < len(items)):
+            raise ValueError("항목 없음")
+        if items[idx]["kind"] == "info":
+            raise ValueError("정보사진은 이동할 수 없습니다 — 먼저 ↩임상으로 바꾸세요")
+        g = next((g for g in _session["groups"] if g["id"] == gid), None)
+        if g is None:
+            raise ValueError("그룹 없음")
+        items[idx]["grp"] = g["key"]
+        _rebuild_groups()
+
+
+def new_group() -> None:
+    """➕ 새 묶음 — 사진을 드래그해 담는 빈 수동 그룹."""
+    with _lock:
+        mgs = _session.setdefault("manual_groups", [])
+        n = 1 + max((int(m["key"][1:]) for m in mgs), default=0)
+        mgs.append({"key": f"m{n}", "num": None, "name": None, "name_source": None,
+                    "date6": None, "enabled": True})
+        _rebuild_groups()
 
 
 def item_action(idx: int, action: str) -> None:
@@ -281,6 +413,7 @@ def item_action(idx: int, action: str) -> None:
                 it["num"], it["ocr_text"], it["ocr_src"] = num, text, src
         elif action == "demote":
             it["kind"] = "clinical"
+            it.pop("edit", None)  # 그룹 소멸 — 그룹 편집 기록도 함께
         elif action in ("to_prev", "to_next", "to_unassigned"):
             # 그룹 재배치는 ts 조작으로 단순화하지 않고 kind 기반 재구성이라,
             # 단일 항목 이동은 promote/demote 조합으로 처리 불가한 경우만 필요 —
@@ -291,15 +424,39 @@ def item_action(idx: int, action: str) -> None:
         _rebuild_groups()
 
 
-def commit(root: str) -> dict:
-    """enabled 그룹을 사진정리 루트로 COPY. 저널 기록(undo=복사본 삭제)."""
+def _same_file(a: str, b: str) -> bool:
+    """이름 충돌 파일의 내용 동일성 — 크기 먼저, 같으면 sha1."""
+    import hashlib
+    try:
+        if os.path.getsize(a) != os.path.getsize(b):
+            return False
+        digests = []
+        for p in (a, b):
+            h = hashlib.sha1()
+            with open(p, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            digests.append(h.digest())
+        return digests[0] == digests[1]
+    except OSError:
+        return False
+
+
+def commit(root: str, dry_run: bool = False) -> dict:
+    """enabled 그룹을 사진정리 루트로 COPY. 저널 기록(undo=복사본 삭제).
+
+    검증→계획→복사 순서: 전 그룹의 문제를 한 번에 모두 보고하고,
+    대상 폴더에 같은 이름·같은 내용 파일이 있으면 dup으로 건너뜀.
+    dry_run=True → 검증+계획만 반환 (복사·상태 변경 없음).
+    """
     from . import writer
     with _lock:
         s = _session
         if s is None or s["status"] != "review":
             raise RuntimeError("리뷰 상태의 세션이 없습니다")
-        s["status"] = "committing"
-        _save()
+        if not dry_run:
+            s["status"] = "committing"
+            _save()
     items = s["items"]
     copies: list[str] = []
     created_dirs: list[str] = []
@@ -308,52 +465,82 @@ def commit(root: str) -> dict:
         with writer.write_lock, db.fs_lock, db.ProcessLock():
             existing = {n.split("_")[0]: n for n in os.listdir(root)
                         if os.path.isdir(os.path.join(root, n)) and re.match(r"^\d{8}_", n)}
-            for g in s["groups"]:
-                if not g["enabled"] or g.get("unassigned"):
-                    continue
+            targets = [g for g in s["groups"]
+                       if g["enabled"] and not g.get("unassigned") and g["item_idxs"]]
+            # 1) 전 그룹 일괄 검증 — 문제를 모아 한 번에 보고
+            errors = []
+            for g in targets:
                 if not g["num"] or not re.fullmatch(r"\d{8}", str(g["num"])):
-                    raise ValueError(f"그룹 {g['id']}: 8자리 진료번호 필요")
-                pdir_name = existing.get(g["num"])
-                if pdir_name is None:
-                    if not g["name"]:
-                        raise ValueError(f"그룹 {g['id']} ({g['num']}): 신규 환자 — 이름 필요")
-                    pdir_name = f"{g['num']}_{g['name']}"
+                    errors.append(f"그룹 {g['id']}: 8자리 진료번호 필요")
+                elif existing.get(g["num"]) is None and not g["name"]:
+                    errors.append(f"그룹 {g['id']} ({g['num']}): 신규 환자 — 이름 필요")
+                if not g["date6"] or not re.fullmatch(r"\d{6}", str(g["date6"])):
+                    errors.append(f"그룹 {g['id']}: 날짜(YYMMDD) 필요")
+            if errors:
+                raise ValueError(" / ".join(errors))
+            # 2) 계획 — 대상 폴더와 이름 충돌(dup/rename) 판정을 복사 전에 확정
+            plan = []
+            for g in targets:
+                pdir_name = existing.get(g["num"]) or f"{g['num']}_{g['name']}"
                 pdir = os.path.join(root, pdir_name)
-                if not os.path.isdir(pdir):
-                    os.makedirs(pdir)
-                    created_dirs.append(pdir)
                 # 같은 날짜(prefix) 폴더가 이미 있으면 거기에 합류 (태그 붙은 폴더 포함)
-                date_dir = next((d for d in os.listdir(pdir)
-                                 if os.path.isdir(os.path.join(pdir, d))
-                                 and d.startswith(g["date6"])), None)
-                if date_dir is None:
-                    date_dir = g["date6"]
-                    os.makedirs(os.path.join(pdir, date_dir))
-                    created_dirs.append(os.path.join(pdir, date_dir))
+                date_dir = None
+                if os.path.isdir(pdir):
+                    date_dir = next((d for d in os.listdir(pdir)
+                                     if os.path.isdir(os.path.join(pdir, d))
+                                     and d.startswith(g["date6"])), None)
+                date_dir = date_dir or g["date6"]
                 ddir = os.path.join(pdir, date_dir)
-                n_copied = 0
+                entries = []
                 for i in g["item_idxs"]:
                     src = os.path.join(s["folder"], items[i]["name"])
                     dst = os.path.join(ddir, items[i]["name"])
                     stem, ext = os.path.splitext(items[i]["name"])
-                    k = 1
+                    kind, k = "new", 1
                     while os.path.exists(dst):
+                        if _same_file(src, dst):
+                            kind = "dup"  # 같은 이름·같은 내용 = 이미 복사됨
+                            break
                         dst = os.path.join(ddir, f"{stem}_{k}{ext}")
-                        k += 1
-                    tmp = dst + ".importing"
-                    shutil.copy2(src, tmp)
-                    os.replace(tmp, dst)  # 부분 복사본이 최종 이름으로 노출되지 않게
-                    copies.append(dst)
+                        kind, k = "renamed", k + 1
+                    entries.append({"src": src, "dst": dst, "kind": kind})
+                plan.append({"gid": g["id"], "pdir": pdir, "ddir": ddir,
+                             "patient": pdir_name, "folder": date_dir, "entries": entries})
+            if dry_run:
+                gs = [{"id": p["gid"], "patient": p["patient"], "folder": p["folder"],
+                       **{f"n_{k}": sum(1 for e in p["entries"] if e["kind"] == k)
+                          for k in ("new", "dup", "renamed")}} for p in plan]
+                return {"dry_run": True, "groups": gs,
+                        "totals": {k: sum(x[f"n_{k}"] for x in gs)
+                                   for k in ("new", "dup", "renamed")}}
+            # 3) 복사 (dup은 건너뜀)
+            dup_skipped = 0
+            for p in plan:
+                n_copied = n_dup = 0
+                for e in p["entries"]:
+                    if e["kind"] == "dup":
+                        n_dup += 1
+                        continue
+                    for d in (p["pdir"], p["ddir"]):
+                        if not os.path.isdir(d):
+                            os.makedirs(d)
+                            created_dirs.append(d)
+                    tmp = e["dst"] + ".importing"
+                    shutil.copy2(e["src"], tmp)
+                    os.replace(tmp, e["dst"])  # 부분 복사본이 최종 이름으로 노출되지 않게
+                    copies.append(e["dst"])
                     n_copied += 1
-                report.append({"group": g["id"], "patient": pdir_name,
-                               "folder": date_dir, "copied": n_copied})
+                dup_skipped += n_dup
+                report.append({"group": p["gid"], "patient": p["patient"],
+                               "folder": p["folder"], "copied": n_copied, "dup": n_dup})
             run_id = writer._write_journal({"kind": "import", "source": s["folder"],
                                             "copies": copies, "created_dirs": created_dirs,
                                             "renames": []}) if copies else None
     except Exception:
-        with _lock:
-            s["status"] = "review"  # 실패 → 리뷰로 복귀, 재시도 가능
-            _save()
+        if not dry_run:
+            with _lock:
+                s["status"] = "review"  # 실패 → 리뷰로 복귀, 재시도 가능
+                _save()
         raise
     with _lock:
         s["status"] = "done"
@@ -362,4 +549,5 @@ def commit(root: str) -> dict:
         _save()
     events.publish("import", {"state": "committed", "run_id": run_id,
                               "copied": len(copies), "groups": len(report)})
-    return {"run_id": run_id, "copied": len(copies), "report": report}
+    return {"run_id": run_id, "copied": len(copies), "dup_skipped": dup_skipped,
+            "report": report}

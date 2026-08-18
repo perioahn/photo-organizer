@@ -567,15 +567,35 @@ async def import_merge(src: int = Body(embed=True), dst: int = Body(embed=True))
     return importer.get_session() or {}
 
 
+@app.post("/api/import/item/{idx}/move")
+async def import_item_move(idx: int, gid: int = Body(embed=True)) -> dict:
+    """사진을 다른 그룹으로 이동 (드래그&드롭)."""
+    from . import importer
+    try:
+        await asyncio.to_thread(importer.move_item, idx, gid)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return importer.get_session() or {}
+
+
+@app.post("/api/import/new_group")
+async def import_new_group() -> dict:
+    """빈 수동 묶음 추가 (➕ 새 묶음)."""
+    from . import importer
+    await asyncio.to_thread(importer.new_group)
+    return importer.get_session() or {}
+
+
 @app.post("/api/import/commit")
-async def import_commit() -> dict:
+async def import_commit(dry_run: bool = Body(default=False, embed=True)) -> dict:
     require_root()
     from . import importer
     try:
-        result = await asyncio.to_thread(importer.commit, ROOT)
+        result = await asyncio.to_thread(importer.commit, ROOT, dry_run)
     except (ValueError, RuntimeError) as e:
         raise HTTPException(409, str(e))
-    await asyncio.to_thread(scanner.full_scan, ROOT)
+    if not dry_run:
+        await asyncio.to_thread(scanner.full_scan, ROOT)
     return result
 
 

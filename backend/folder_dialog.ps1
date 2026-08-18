@@ -1,4 +1,4 @@
-# 모던 폴더 선택 대화상자 (탐색기 스타일, IFileOpenDialog + FOS_PICKFOLDERS).
+﻿# 모던 폴더 선택 대화상자 (탐색기 스타일, IFileOpenDialog + FOS_PICKFOLDERS).
 # 실패 시 구형 FolderBrowserDialog 폴백. 선택 경로를 stdout으로 출력, 취소 = 출력 없음.
 param([string]$Initial = "")
 

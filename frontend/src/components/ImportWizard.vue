@@ -8,6 +8,7 @@ interface Item { name: string; kind: 'info' | 'clinical'; num: string | null; ts
 interface Group {
   id: number; num: string | null; name: string | null; date6: string | null
   enabled: boolean; info_idx: number | null; item_idxs: number[]; unassigned?: boolean
+  name_source?: string | null; manual?: boolean
 }
 interface Session {
   status: string; folder?: string; items?: Item[]; groups?: Group[]
@@ -88,28 +89,95 @@ async function itemAction(idx: number, action: 'promote' | 'demote') {
 
 async function commit() {
   const st = enabledStats.value
-  if (!window.confirm(
-    `선택된 ${st.groups}개 묶음(${st.photos}장)을 사진정리 폴더로 복사할까요?\n` +
-    '원본은 그대로 두고 복사만 하며, 되돌리기가 가능합니다.')) return
   busy.value = true
-  msg.value = '복사 중…'
   try {
-    const res = await fetch('/api/import/commit', { method: 'POST' })
+    // 확인 전에 미저장 입력(blur 전) 전부 서버로 플러시 — 실패해도 입력이 남게
+    await Promise.all(groups.value.filter((g) => !g.unassigned).map((g) =>
+      patchGroup(g, { num: g.num, name: g.name, date6: g.date6 })))
+    const dryRes = await fetch('/api/import/commit', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dry_run: true }),
+    })
+    const dry = await dryRes.json()
+    if (!dryRes.ok) throw new Error(dry.detail ?? `HTTP ${dryRes.status}`)
+    const t = dry.totals
+    if (t.dup && !(t.new + t.renamed)) {
+      window.alert('모든 사진이 이미 복사되어 있습니다. 복사할 새 사진이 없습니다.')
+      return
+    }
+    let text =
+      `선택된 ${st.groups}개 묶음(${st.photos}장)을 사진정리 폴더로 복사할까요?\n` +
+      '원본은 그대로 두고 복사만 하며, 되돌리기가 가능합니다.'
+    if (t.dup) {
+      text += `\n이미 복사된 동일 사진 ${t.dup}장은 건너뜁니다.`
+      for (const g of dry.groups)
+        if (g.n_dup && !g.n_new && !g.n_renamed) text += `\n그룹 ${g.id}은 전부 이미 복사되어 있음`
+    }
+    if (!window.confirm(text)) return
+    msg.value = '복사 중…'
+    const res = await fetch('/api/import/commit', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dry_run: false }),
+    })
     const d = await res.json()
     if (!res.ok) throw new Error(d.detail ?? `HTTP ${res.status}`)
     await refresh()
-    emit('committed', `가져오기 완료: ${d.copied}장 복사 (되돌리기 가능)`)
+    emit('committed', d.dup_skipped
+      ? `가져오기 완료: ${d.copied}장 복사, ${d.dup_skipped}장 중복 건너뜀`
+      : `가져오기 완료: ${d.copied}장 복사 (되돌리기 가능)`)
   } catch (e: any) {
     msg.value = `복사 실패: ${e.message ?? e}`
-    await refresh()
+    // 실패 시 refresh() 안 함 — 입력 중이던 값 보존
   } finally {
     busy.value = false
   }
 }
 
-// 그룹 드래그 병합 (중복 촬영 등으로 묶음이 갈라졌을 때)
+// 그룹 드래그 병합 (중복 촬영 등으로 묶음이 갈라졌을 때) + 사진 드래그 이동
 const dragGid = ref<number | null>(null)
 const dropGid = ref<number | null>(null)
+
+function onGroupDragStart(e: DragEvent, g: Group) {
+  dragGid.value = g.id
+  e.dataTransfer?.setData('text/plain', JSON.stringify({ type: 'group', id: g.id }))
+}
+
+function onThumbDragStart(e: DragEvent, idx: number) {
+  e.dataTransfer?.setData('text/plain', JSON.stringify({ type: 'item', idx }))
+}
+
+async function onDrop(e: DragEvent, g: Group) {
+  dropGid.value = null
+  let payload: any = null
+  try { payload = JSON.parse(e.dataTransfer?.getData('text/plain') ?? '') } catch { /* 무시 */ }
+  if (payload?.type === 'item') await moveItem(payload.idx, g)
+  else await mergeInto(g)
+}
+
+async function moveItem(idx: number, dst: Group) {
+  busy.value = true
+  try {
+    const res = await fetch(`/api/import/item/${idx}/move`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ gid: dst.id }),
+    })
+    if (!res.ok) throw new Error((await res.json()).detail ?? '이동 실패')
+    session.value = await res.json()
+    msg.value = '사진 이동됨'
+  } catch (e: any) {
+    msg.value = `이동 실패: ${e.message ?? e}`
+  } finally {
+    busy.value = false
+  }
+}
+
+async function newGroup() {
+  const res = await fetch('/api/import/new_group', { method: 'POST' })
+  if (!res.ok) return
+  session.value = await res.json()
+  const last = groups.value[groups.value.length - 1]
+  if (last?.manual) selectedGid.value = last.id
+}
 
 async function mergeInto(dst: Group) {
   const srcId = dragGid.value
@@ -210,11 +278,13 @@ onUnmounted(() => es?.close())
       <template v-else-if="session.status === 'review' || session.status === 'committing'">
         <p class="review-hint">
           묶음을 검토하세요: 번호/이름/날짜 수정, 묶음 제외, 임상사진의 ✂로 묶음 분리,
-          묶음을 드래그해 다른 묶음에 놓으면 병합.
+          묶음 드래그=병합, 사진 드래그=다른 묶음으로 이동.
           <span v-if="msg"> · {{ msg }}</span>
         </p>
         <div class="import-body">
           <div class="import-groups">
+            <button class="gen-btn" :disabled="busy" title="빈 묶음을 만들고 사진을 드래그해 담기"
+                    @click="newGroup">➕ 새 묶음</button>
             <div
               v-for="g in groups"
               :key="g.id"
@@ -224,11 +294,11 @@ onUnmounted(() => es?.close())
               :draggable="!g.unassigned"
               :title="g.unassigned ? '' : '드래그해서 다른 묶음에 놓으면 병합'"
               @click="selectedGid = g.id"
-              @dragstart="dragGid = g.id"
+              @dragstart="onGroupDragStart($event, g)"
               @dragend="dragGid = null; dropGid = null"
               @dragover.prevent="dropGid = g.id"
               @dragleave="dropGid === g.id && (dropGid = null)"
-              @drop.prevent="mergeInto(g)"
+              @drop.prevent="onDrop($event, g)"
             >
               <input type="checkbox" :checked="g.enabled" :disabled="g.unassigned"
                      @click.stop @change="patchGroup(g, { enabled: ($event.target as HTMLInputElement).checked })" />
@@ -259,10 +329,14 @@ onUnmounted(() => es?.close())
               <span v-else-if="selected.num" class="warn-badge">
                 ⚠ 기존 환자 없음 — 번호를 확인하세요 (신규 환자면 이름 입력)
               </span>
+              <span v-if="selected.name_source === 'schedule'" class="known-badge">📅 일정표에서 찾음</span>
             </div>
             <div class="import-thumbs">
               <div v-for="i in selected.item_idxs" :key="i" class="import-thumb"
-                   :class="{ info: items[i]?.kind === 'info' }">
+                   :class="{ info: items[i]?.kind === 'info' }"
+                   :draggable="items[i]?.kind === 'clinical'"
+                   :title="items[i]?.kind === 'clinical' ? '드래그해서 다른 묶음으로 이동' : ''"
+                   @dragstart="onThumbDragStart($event, i)">
                 <img :src="`/api/import/thumb/${i}`" loading="lazy" />
                 <div class="thumb-tools">
                   <span v-if="items[i]?.kind === 'info'" class="badge">정보</span>
