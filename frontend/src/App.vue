@@ -202,6 +202,31 @@ onUnmounted(() => {
   es?.close()
 })
 
+// 뷰어가 들고 있는 파일 id가 낡았을 때(폴더 리네임 후 재스캔) 새 id로 재구성
+async function onViewerStale(fileName: string) {
+  const cur = viewer.value
+  if (!cur) return
+  await load()
+  const p = patients.value.find((x) => x.folder_name === cur.patient.folder_name)
+  const f = p?.folders.find((x) => x.name === cur.folder.name)
+    ?? p?.folders.find((x) => x.date6 && x.date6 === cur.folder.date6)
+  if (!p || !f) {
+    viewer.value = null
+    statusMsg.value = '폴더가 변경되어 목록을 새로고침했습니다'
+    return
+  }
+  try {
+    const files = (await api.folderFiles(f.id)).filter((x) => x.kind !== 'video')
+    if (!files.length) throw new Error('빈 폴더')
+    const idx = Math.max(0, files.findIndex((x) => x.name === fileName))
+    viewer.value = { files, index: idx, folder: f, patient: p }
+    statusMsg.value = '변경된 폴더를 다시 불러왔습니다'
+  } catch {
+    viewer.value = null
+    statusMsg.value = '폴더가 변경되어 목록을 새로고침했습니다'
+  }
+}
+
 function onViewerClose() {
   viewer.value = null
   if (refreshQueued) {
@@ -320,6 +345,7 @@ function onViewerClose() {
       :folder="viewer.folder"
       :patient="viewer.patient"
       @close="onViewerClose"
+      @stale="onViewerStale"
     />
     <Settings
       v-if="showSettings"
