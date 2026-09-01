@@ -13,6 +13,7 @@ const emit = defineEmits<{
   open: [payload: { files: FileEntry[]; index: number; folder: FolderNode }]
   pdf: [date6: string | null]
   written: [runId: string | null, msg: string]
+  editPatient: []
 }>()
 
 const adding = ref(false)
@@ -90,6 +91,26 @@ function fmtDate(d: string | null): string {
   return `20${d.slice(0, 2)}-${d.slice(2, 4)}-${d.slice(4, 6)}`
 }
 
+async function editDate() {
+  const cur = props.folder.date6
+  if (!cur) return
+  const v = window.prompt('촬영일 (YYMMDD)', cur)?.trim()
+  if (!v || v === cur) return
+  try {
+    const res = await fetch(`/api/folder/${props.folder.id}/date`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ date6: v }),
+    })
+    const d = await res.json()
+    if (!res.ok) throw new Error(d.detail ?? `HTTP ${res.status}`)
+    props.folder.name = d.new
+    props.folder.date6 = v
+    emit('written', d.run_id, `${d.old} → ${d.new}`)
+  } catch (e: any) {
+    emit('written', null, `촬영일 수정 실패: ${e.message ?? e}`)
+  }
+}
+
 function openAt(i: number) {
   emit('open', { files: files.value, index: i, folder: props.folder })
 }
@@ -103,7 +124,10 @@ watch(() => props.showSub, (v) => { subOpen.value = v ?? false })
   <div ref="el" class="folder-card" :class="{ irregular: !folder.is_regular, nested }">
     <div class="folder-head">
       <span v-if="patientLabel" class="fpatient">{{ patientLabel }}</span>
-      <span v-if="folder.date6" class="fdate">{{ fmtDate(folder.date6) }}</span>
+      <button v-if="patientLabel" class="icon-btn" title="진료번호·이름 수정"
+              @click.stop="emit('editPatient')">✏</button>
+      <span v-if="folder.date6" class="fdate fdate-edit" title="촬영일 수정"
+            @click.stop="editDate">{{ fmtDate(folder.date6) }}</span>
       <span v-else class="fname">{{ folder.name }}</span>
       <span
         v-for="t in displayTags"
@@ -167,6 +191,7 @@ watch(() => props.showSub, (v) => { subOpen.value = v ?? false })
         @open="(p) => emit('open', p)"
         @pdf="(d) => emit('pdf', d)"
         @written="(r, m) => emit('written', r, m)"
+        @edit-patient="emit('editPatient')"
       />
     </template>
   </div>

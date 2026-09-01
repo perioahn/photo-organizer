@@ -144,6 +144,155 @@ def rename_folder(root: str, folder_id: int, new_name: str, reason: str = "manua
     return {"run_id": run_id, "old": old_name, "new": new_name, "noop": False}
 
 
+def rename_patient(root: str, patient_id: int, num: str, name: str) -> dict:
+    """환자 폴더(A폴더) 이름 변경 — 진료번호/이름 오타 수정용. 저널로 undo 가능."""
+    num, name = (num or "").strip(), (name or "").strip()
+    if not re.fullmatch(r"\d{8}", num):
+        raise WriteError("진료번호는 숫자 8자리여야 합니다")
+    if not name:
+        raise WriteError("환자 이름을 입력하세요")
+    new_folder = f"{num}_{name}"
+    validate_folder_name(new_folder)
+    conn = db.connect()
+    with write_lock, db.fs_lock, db.ProcessLock():
+        with db.lock:
+            r = conn.execute("SELECT folder_name FROM patients WHERE id=?",
+                             (patient_id,)).fetchone()
+        if r is None:
+            raise WriteError("환자가 인덱스에 없음 (rescan 필요)")
+        old_folder = r["folder_name"]
+        if old_folder == new_folder:
+            return {"run_id": None, "old": old_folder, "new": new_folder, "noop": True}
+        old_path = os.path.join(root, old_folder)
+        new_path = os.path.join(root, new_folder)
+        if not os.path.isdir(old_path):
+            raise WriteError(f"원본 폴더가 디스크에 없음: {old_folder} (동기화 중?)")
+        if os.path.exists(new_path):
+            raise WriteError(f"같은 이름의 환자 폴더가 이미 있습니다: {new_folder}"
+                             " — 합치려면 환자 폴더 합치기를 사용하세요")
+        _rename_with_retry(old_path, new_path)
+        run_id = _write_journal({"kind": "rename_patient",
+                                 "renames": [[old_path, new_path]]})
+        with db.lock:
+            conn.execute(
+                "UPDATE patients SET folder_name=?, patient_num=?, patient_name=? WHERE id=?",
+                (new_folder, num, name, patient_id))
+            conn.commit()
+    events.publish("folder", {"state": "patient_renamed", "patient_id": patient_id,
+                              "old": old_folder, "new": new_folder, "run_id": run_id})
+    log.info("rename patient [%s]: %s -> %s", run_id, old_folder, new_folder)
+    return {"run_id": run_id, "old": old_folder, "new": new_folder, "noop": False}
+
+
+def merge_patients(root: str, src_id: int, dst_id: int, dry_run: bool = False) -> dict:
+    """환자 폴더 합치기 — src의 촬영일 폴더를 dst로 이동 (번호 오타로 갈라진 환자 복구).
+
+    같은 날짜(date6) 폴더가 양쪽에 있으면 dst 폴더로 사진만 옮겨 합치고, 태그는
+    양쪽 합집합으로 갱신한다. dry_run이면 계획만 반환하고 디스크는 건드리지 않는다.
+    """
+    from . import tagsort
+    conn = db.connect()
+    with write_lock, db.fs_lock, db.ProcessLock():
+        with db.lock:
+            rows = conn.execute(
+                "SELECT id, folder_name FROM patients WHERE id IN (?,?)",
+                (src_id, dst_id)).fetchall()
+        by_id = {r["id"]: r["folder_name"] for r in rows}
+        if src_id not in by_id or dst_id not in by_id or src_id == dst_id:
+            raise WriteError("합칠 환자를 찾을 수 없습니다")
+        src_dir = os.path.join(root, by_id[src_id])
+        dst_dir = os.path.join(root, by_id[dst_id])
+        if not os.path.isdir(src_dir) or not os.path.isdir(dst_dir):
+            raise WriteError("환자 폴더가 디스크에 없습니다 (동기화 중?)")
+
+        cfg = tagsort.load_config(root)
+        dst_by_date = {}
+        for n in os.listdir(dst_dir):
+            if os.path.isdir(os.path.join(dst_dir, n)):
+                d6, _ = scanner.parse_b_folder(n)
+                if d6:
+                    dst_by_date[d6] = n
+        moves, merges = [], []
+        for n in sorted(os.listdir(src_dir)):
+            sp = os.path.join(src_dir, n)
+            if not os.path.isdir(sp):
+                continue
+            d6, tags = scanner.parse_b_folder(n)
+            twin = dst_by_date.get(d6) if d6 else None
+            if twin is None and not os.path.exists(os.path.join(dst_dir, n)):
+                moves.append((n, n))
+            elif twin is None:
+                moves.append((n, n + "_2"))  # 날짜 없는 폴더 이름 충돌 회피
+            else:
+                _, twin_tags = scanner.parse_b_folder(twin)
+                merged = list(dict.fromkeys(twin_tags + tags))
+                status = [t for t in merged if t.startswith("@")]
+                rest = tagsort.sort_tags([t for t in merged if not t.startswith("@")], cfg)
+                new_twin = d6 + ("_" + "_".join(status + rest) if (status + rest) else "")
+                merges.append((n, twin, new_twin))
+        plan = {"src": by_id[src_id], "dst": by_id[dst_id],
+                "move": len(moves), "merge": len(merges),
+                "details": {"moves": [m[0] for m in moves],
+                            "merges": [[m[0], m[1]] for m in merges]}}
+        if dry_run:
+            return {**plan, "dry_run": True}
+
+        renames: list[list[str]] = []
+        for src_name, dst_name in moves:
+            a, b = os.path.join(src_dir, src_name), os.path.join(dst_dir, dst_name)
+            _rename_with_retry(a, b)
+            renames.append([a, b])
+        for src_name, twin, new_twin in merges:
+            sp, tp = os.path.join(src_dir, src_name), os.path.join(dst_dir, twin)
+            for f in sorted(os.listdir(sp)):
+                a = os.path.join(sp, f)
+                stem, ext = os.path.splitext(f)
+                b, k = os.path.join(tp, f), 1
+                while os.path.exists(b):
+                    b = os.path.join(tp, f"{stem}_{k}{ext}")
+                    k += 1
+                _rename_with_retry(a, b)
+                renames.append([a, b])
+            try:
+                os.rmdir(sp)  # 비었을 때만 (남은 게 있으면 보존)
+            except OSError:
+                log.warning("병합 후 원본 폴더가 비지 않음: %s", sp)
+            if new_twin != twin:
+                np_ = os.path.join(dst_dir, new_twin)
+                if not os.path.exists(np_):
+                    _rename_with_retry(tp, np_)
+                    renames.append([tp, np_])
+        try:
+            os.rmdir(src_dir)
+        except OSError:
+            log.warning("합치기 후 환자 폴더가 비지 않음: %s", src_dir)
+        run_id = _write_journal({"kind": "merge_patients", "renames": renames})
+    scanner.full_scan(root)  # 구조가 크게 바뀌므로 즉시 재스캔
+    events.publish("folder", {"state": "patients_merged", "run_id": run_id, **plan})
+    log.info("merge patients [%s]: %s -> %s (이동 %d·병합 %d)",
+             run_id, plan["src"], plan["dst"], plan["move"], plan["merge"])
+    return {**plan, "run_id": run_id, "dry_run": False}
+
+
+def set_folder_date(root: str, folder_id: int, date6: str) -> dict:
+    """촬영일 변경 — 태그는 그대로 두고 날짜 부분만 교체."""
+    date6 = (date6 or "").strip()
+    if not re.fullmatch(r"\d{6}", date6):
+        raise WriteError("촬영일은 YYMMDD 6자리여야 합니다")
+    if not ("01" <= date6[2:4] <= "12" and "01" <= date6[4:6] <= "31"):
+        raise WriteError(f"날짜가 올바르지 않습니다: {date6}")
+    conn = db.connect()
+    with db.lock:
+        r = conn.execute("SELECT name FROM folders WHERE id=?", (folder_id,)).fetchone()
+    if r is None:
+        raise WriteError("폴더가 인덱스에 없음 (rescan 필요)")
+    old_d6, tags = scanner.parse_b_folder(r["name"])
+    if old_d6 is None:
+        raise WriteError("날짜 형식(YYMMDD…) 폴더만 촬영일을 바꿀 수 있습니다")
+    new_name = date6 + ("_" + "_".join(tags) if tags else "")
+    return rename_folder(root, folder_id, new_name, reason="set_date")
+
+
 def edit_tags(root: str, folder_id: int, add: list[str], remove: list[str],
               reason: str = "manual") -> dict:
     """태그 추가/삭제 = 새 폴더명 계산 후 rename_folder.
@@ -340,7 +489,12 @@ def undo(root: str, run_id: str) -> dict:
     done, skipped = [], []
     with write_lock, db.fs_lock, db.ProcessLock():
         for old_path, new_path in reversed(entry.get("renames", [])):
-            if os.path.isdir(new_path) and not os.path.exists(old_path):
+            # 폴더뿐 아니라 파일 이동(환자 합치기)도 되돌린다.
+            # 합치기 때 비워져 삭제된 상위 폴더는 복원 전에 다시 만든다.
+            if os.path.exists(new_path) and not os.path.exists(old_path):
+                parent = os.path.dirname(old_path)
+                if parent and not os.path.isdir(parent):
+                    os.makedirs(parent, exist_ok=True)
                 _rename_with_retry(new_path, old_path)
                 done.append([new_path, old_path])
             else:

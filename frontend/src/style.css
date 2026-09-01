@@ -374,3 +374,11 @@ body {
   border-radius: 999px; padding: 1px 10px; font-size: 11.5px; cursor: pointer;
 }
 .susp-folder:hover { border-color: var(--accent); }
+
+.susp-merge {
+  background: #a5723a; color: #fff; border: none; border-radius: 999px;
+  padding: 1px 10px; font-size: 11.5px; cursor: pointer;
+}
+.susp-merge:hover { filter: brightness(1.15); }
+.fdate-edit { cursor: pointer; }
+.fdate-edit:hover { text-decoration: underline dotted; }

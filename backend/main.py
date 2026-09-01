@@ -766,6 +766,29 @@ async def rename_folder(folder_id: int, new_name: str = Body(embed=True)) -> dic
     return await asyncio.to_thread(_write, writer.rename_folder, ROOT, folder_id, new_name)
 
 
+@app.post("/api/patient/{patient_id}/rename")
+async def rename_patient(patient_id: int, num: str = Body(embed=True),
+                         name: str = Body(embed=True)) -> dict:
+    """환자 폴더 진료번호·이름 수정 (오타 교정)."""
+    require_root()
+    return await asyncio.to_thread(_write, writer.rename_patient, ROOT, patient_id, num, name)
+
+
+@app.post("/api/patients/merge")
+async def merge_patients(src: int = Body(embed=True), dst: int = Body(embed=True),
+                         dry_run: bool = Body(default=False, embed=True)) -> dict:
+    """환자 폴더 합치기 — src의 촬영일 폴더를 dst로 이동 (dry_run이면 계획만)."""
+    require_root()
+    return await asyncio.to_thread(_write, writer.merge_patients, ROOT, src, dst, dry_run)
+
+
+@app.post("/api/folder/{folder_id}/date")
+async def set_folder_date(folder_id: int, date6: str = Body(embed=True)) -> dict:
+    """촬영일(YYMMDD) 수정 — 태그는 유지."""
+    require_root()
+    return await asyncio.to_thread(_write, writer.set_folder_date, ROOT, folder_id, date6)
+
+
 @app.post("/api/folder/{folder_id}/tags")
 async def edit_tags(folder_id: int, add: list[str] = Body(default=[]),
                     remove: list[str] = Body(default=[])) -> dict:
