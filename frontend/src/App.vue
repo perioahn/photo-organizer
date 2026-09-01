@@ -108,6 +108,21 @@ function toggleSub() {
   localStorage.setItem('showSub', showSub.value ? '1' : '0')
 }
 
+// 의심 폴더 경고 — 진료번호 오타로 갈라진 환자 폴더 (구 앱 기능)
+interface SuspGroup { name?: string; num?: string; folders: string[] }
+const susp = ref<{ case1: SuspGroup[]; case2: SuspGroup[] }>({ case1: [], case2: [] })
+const suspOpen = ref(false)
+const suspCount = computed(() => susp.value.case1.length + susp.value.case2.length)
+
+async function loadSuspicious() {
+  try { susp.value = await (await fetch('/api/suspicious')).json() } catch { /* 무시 */ }
+}
+
+function searchFolder(folder: string) {
+  query.value = folder
+  load()
+}
+
 async function load(q = query.value) {
   const seq = ++loadSeq // 늦게 도착한 이전 응답이 최신 결과를 덮지 않게
   loading.value = true
@@ -179,6 +194,7 @@ function onKey(e: KeyboardEvent) {
 
 onMounted(() => {
   load()
+  loadSuspicious()
   loadTagRanks().catch(() => {})
   checkRoot()
   checkImportSession()
@@ -189,6 +205,7 @@ onMounted(() => {
       // 뷰어 사용 중이면 닫힐 때까지 미룸 — 작업 중 새로고침으로 방해하지 않기
       if (viewer.value) refreshQueued = true
       else load()
+      loadSuspicious()
     },
     prewarm: (d) => {
       statusMsg.value =
@@ -289,6 +306,23 @@ function onViewerClose() {
     </aside>
 
     <main class="content">
+      <div v-if="suspCount" class="susp-banner">
+        <button class="susp-head" @click="suspOpen = !suspOpen">
+          ⚠ 진료번호 오타 의심 {{ suspCount }}건 {{ suspOpen ? '▾' : '▸' }}
+        </button>
+        <div v-if="suspOpen" class="susp-body">
+          <div v-for="g in susp.case1" :key="'n' + g.name" class="susp-item">
+            <span class="susp-kind">이름 같고 번호 다름</span>
+            <span class="susp-why">{{ g.name }}</span>
+            <button v-for="f in g.folders" :key="f" class="susp-folder" @click="searchFolder(f)">{{ f }}</button>
+          </div>
+          <div v-for="g in susp.case2" :key="'c' + g.num" class="susp-item">
+            <span class="susp-kind alt">번호 같고 이름 다름</span>
+            <span class="susp-why">{{ g.num }}</span>
+            <button v-for="f in g.folders" :key="f" class="susp-folder" @click="searchFolder(f)">{{ f }}</button>
+          </div>
+        </div>
+      </div>
       <div v-if="error" class="error-banner">
         {{ error }} <button @click="load()">재시도</button>
       </div>

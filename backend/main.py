@@ -326,18 +326,70 @@ def search(q: str = "") -> list[dict]:
                 """SELECT DISTINCT p.id FROM patients p JOIN folders f ON f.patient_id=p.id
                    WHERE f.is_regular=1 AND NOT EXISTS(SELECT 1 FROM tags t WHERE t.folder_id=f.id)"""
             )]
-        else:
-            ids = [r["id"] for r in conn.execute(
-                """
-                SELECT DISTINCT p.id FROM patients p
-                LEFT JOIN folders f ON f.patient_id = p.id
-                LEFT JOIN tags t ON t.folder_id = f.id
-                LEFT JOIN files fi ON fi.folder_id = f.id
-                WHERE p.folder_name LIKE ? OR f.name LIKE ? OR t.tag LIKE ? OR fi.name LIKE ?
-                """,
-                (like, like, like, like),
-            )]
-    return _folder_rows_to_tree(conn, ids)
+            return _folder_rows_to_tree(conn, ids)
+        # 환자 일치(이름·진료번호) = 그 환자의 전체 폴더를 보여준다
+        pat_ids = {r["id"] for r in conn.execute(
+            "SELECT id FROM patients WHERE folder_name LIKE ?", (like,))}
+        # 폴더 일치(폴더명·태그·파일명) = 해당 폴더만 보여준다
+        frows = conn.execute(
+            """SELECT DISTINCT f.id, f.patient_id FROM folders f
+               LEFT JOIN tags t ON t.folder_id = f.id
+               LEFT JOIN files fi ON fi.folder_id = f.id
+               WHERE f.name LIKE ? OR t.tag LIKE ? OR fi.name LIKE ?""",
+            (like, like, like),
+        ).fetchall()
+    folder_ids = {r["id"] for r in frows}
+    tree = _folder_rows_to_tree(conn, sorted(pat_ids | {r["patient_id"] for r in frows}))
+    out = []
+    for p in tree:
+        if p["id"] not in pat_ids:  # 태그 등으로 걸린 환자 → 일치 폴더만 남긴다
+            p["folders"] = [f for f in p["folders"]
+                            if f["id"] in folder_ids
+                            or any(c["id"] in folder_ids for c in f["children"])]
+        if p["folders"]:
+            out.append(p)
+    return out
+
+
+@app.get("/api/suspicious")
+def suspicious_patients() -> dict:
+    """진료번호 오타로 갈라진 듯한 환자 폴더 경고 (구 앱 기능 이식).
+
+    case1: 이름이 같은데 번호가 1~2자리만 다름 (오타로 새 폴더가 생긴 정황)
+    case2: 번호가 같은데 이름이 다름 (동명이인 오기입·개명 등)
+    """
+    from itertools import combinations
+
+    conn = db.connect()
+    with db.lock:
+        rows = conn.execute(
+            """SELECT folder_name, patient_num, patient_name FROM patients
+               WHERE patient_num IS NOT NULL AND patient_name IS NOT NULL"""
+        ).fetchall()
+    by_name: dict[str, list] = {}
+    by_num: dict[str, list] = {}
+    for r in rows:
+        by_name.setdefault(r["patient_name"], []).append((r["folder_name"], r["patient_num"]))
+        by_num.setdefault(r["patient_num"], []).append((r["folder_name"], r["patient_name"]))
+
+    case1 = []
+    for name, items in by_name.items():
+        if len(items) < 2:
+            continue
+        group = set()
+        for (f1, n1), (f2, n2) in combinations(items, 2):
+            if len(n1) == len(n2):
+                dist = sum(1 for a, b in zip(n1, n2) if a != b)
+                if 0 < dist <= 2:
+                    group |= {f1, f2}
+        if group:
+            case1.append({"name": name, "folders": sorted(group)})
+
+    case2 = [{"num": num, "folders": sorted(f for f, _ in items)}
+             for num, items in by_num.items()
+             if len({n for _, n in items}) > 1]
+
+    return {"case1": case1, "case2": sorted(case2, key=lambda x: x["num"])}
 
 
 @app.get("/api/tags")
