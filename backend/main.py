@@ -766,20 +766,40 @@ async def rename_folder(folder_id: int, new_name: str = Body(embed=True)) -> dic
     return await asyncio.to_thread(_write, writer.rename_folder, ROOT, folder_id, new_name)
 
 
+@app.get("/api/patient_by_num/{num}")
+def patient_by_num(num: str) -> dict:
+    """진료번호로 기존 환자 조회 — 편집 중 중복 번호 실시간 감지용."""
+    conn = db.connect()
+    with db.lock:
+        r = conn.execute(
+            """SELECT p.id, p.folder_name, p.patient_name,
+                      (SELECT COUNT(*) FROM folders f WHERE f.patient_id=p.id AND f.parent_id=0) n
+               FROM patients p WHERE p.patient_num=?""", (num,)).fetchone()
+    return {"found": r is not None, **(dict(r) if r else {})}
+
+
 @app.post("/api/patient/{patient_id}/rename")
 async def rename_patient(patient_id: int, num: str = Body(embed=True),
-                         name: str = Body(embed=True)) -> dict:
-    """환자 폴더 진료번호·이름 수정 (오타 교정)."""
+                         name: str = Body(embed=True),
+                         expect_folder: str | None = Body(default=None, embed=True)) -> dict:
+    """환자 폴더 진료번호·이름 수정 (오타 교정). expect_folder로 stale 편집 차단."""
     require_root()
-    return await asyncio.to_thread(_write, writer.rename_patient, ROOT, patient_id, num, name)
+    return await asyncio.to_thread(_write, writer.rename_patient, ROOT, patient_id,
+                                   num, name, expect_folder)
 
 
 @app.post("/api/patients/merge")
 async def merge_patients(src: int = Body(embed=True), dst: int = Body(embed=True),
-                         dry_run: bool = Body(default=False, embed=True)) -> dict:
-    """환자 폴더 합치기 — src의 촬영일 폴더를 dst로 이동 (dry_run이면 계획만)."""
+                         dry_run: bool = Body(default=False, embed=True),
+                         token: str | None = Body(default=None, embed=True)) -> dict:
+    """환자 폴더 합치기 — src의 촬영일 폴더를 dst로 이동.
+
+    dry_run=true면 계획+token만 반환하고, 실제 실행은 그 token을 함께 보내야 한다
+    (검토 후 디스크가 바뀌면 409).
+    """
     require_root()
-    return await asyncio.to_thread(_write, writer.merge_patients, ROOT, src, dst, dry_run)
+    return await asyncio.to_thread(_write, writer.merge_patients, ROOT, src, dst,
+                                   dry_run, token)
 
 
 @app.post("/api/folder/{folder_id}/date")

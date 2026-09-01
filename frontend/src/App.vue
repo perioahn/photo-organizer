@@ -3,6 +3,8 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { api, connectEvents, loadTagRanks, type FileEntry, type FolderNode, type Patient } from './api'
 import FolderCard from './components/FolderCard.vue'
 import ImportWizard from './components/ImportWizard.vue'
+import MergeReviewDialog from './components/MergeReviewDialog.vue'
+import PatientEditDialog from './components/PatientEditDialog.vue'
 import Settings from './components/Settings.vue'
 import Viewer from './components/Viewer.vue'
 
@@ -123,73 +125,39 @@ function searchFolder(folder: string) {
   load()
 }
 
-async function editPatient(p: Patient) {
-  const num = window.prompt('진료번호 (8자리)', p.num ?? '')?.trim()
-  if (num === undefined || num === null) return
-  const name = window.prompt('환자 이름', p.name ?? '')?.trim()
-  if (!name) return
-  try {
-    const res = await fetch(`/api/patient/${p.id}/rename`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ num, name }),
-    })
-    const d = await res.json()
-    if (!res.ok) throw new Error(d.detail ?? `HTTP ${res.status}`)
-    if (d.run_id) lastRunId.value = d.run_id
-    statusMsg.value = d.noop ? '변경 없음' : `${d.old} → ${d.new}`
-    await load()
-    loadSuspicious()
-  } catch (e: any) {
-    statusMsg.value = `환자 수정 실패: ${e.message ?? e}`
-  }
+// 편집 다이얼로그 상태 (목록이 갱신돼도 유지되도록 App 레벨에서 관리)
+const editing = ref<Patient | null>(null)
+const merging = ref<string[] | null>(null)
+
+function editPatient(p: Patient) {
+  editing.value = p
 }
 
-async function mergePatients(folders: string[]) {
-  const pick = window.prompt(
-    `어느 폴더로 합칠까요? (남길 폴더 번호 입력)\n` +
-    folders.map((f, i) => `${i + 1}. ${f}`).join('\n'), '1')
-  const idx = Number(pick) - 1
-  if (!(idx >= 0 && idx < folders.length)) return
-  const dstName = folders[idx]
-  const srcNames = folders.filter((_, i) => i !== idx)
-  const byName = new Map(patients.value.map((p) => [p.folder_name, p.id]))
-  const dst = byName.get(dstName)
-  if (dst === undefined) {
-    // 검색 상태라 목록에 없을 수 있음 — 전체 트리로 확인
-    const all: Patient[] = await api.tree()
-    all.forEach((p) => byName.set(p.folder_name, p.id))
-  }
-  for (const srcName of srcNames) {
-    const src = byName.get(srcName)
-    const dstId = byName.get(dstName)
-    if (src === undefined || dstId === undefined) {
-      statusMsg.value = '환자 폴더를 찾지 못했습니다 (새로고침 후 재시도)'
-      return
-    }
-    try {
-      const pre = await (await fetch('/api/patients/merge', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ src, dst: dstId, dry_run: true }),
-      })).json()
-      if (!window.confirm(
-        `${pre.src} → ${pre.dst}\n\n촬영일 폴더 ${pre.move}개 이동` +
-        (pre.merge ? `, 같은 날짜 ${pre.merge}개는 합쳐집니다` : '') +
-        '\n\n진행할까요? (되돌리기 가능)')) return
-      const res = await fetch('/api/patients/merge', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ src, dst: dstId, dry_run: false }),
-      })
-      const d = await res.json()
-      if (!res.ok) throw new Error(d.detail ?? `HTTP ${res.status}`)
-      if (d.run_id) lastRunId.value = d.run_id
-      statusMsg.value = `합침: ${d.src} → ${d.dst} (이동 ${d.move}·병합 ${d.merge})`
-    } catch (e: any) {
-      statusMsg.value = `합치기 실패: ${e.message ?? e}`
-      return
-    }
-  }
-  await load()
+function onEdited(runId: string | null, msg: string) {
+  if (runId) lastRunId.value = runId
+  statusMsg.value = msg
+  load()
   loadSuspicious()
+}
+
+async function openMerge(folders: string[]) {
+  // 검색 중이면 목록에 상대 환자가 없을 수 있어 전체 트리를 확보한다
+  if (!folders.every((f) => patients.value.some((p) => p.folder_name === f))) {
+    allPatients.value = await api.tree()
+  } else {
+    allPatients.value = patients.value
+  }
+  merging.value = folders
+}
+
+const allPatients = ref<Patient[]>([])
+
+function mergeFromDialog(srcId: number, dstId: number) {
+  const byId = new Map(patients.value.map((p) => [p.id, p.folder_name]))
+  const a = byId.get(srcId)
+  const b = byId.get(dstId)
+  editing.value = null
+  if (a && b) openMerge([b, a])  // 남길 후보를 상대(기존 번호 소유자) 먼저
 }
 
 async function load(q = query.value) {
@@ -384,7 +352,7 @@ function onViewerClose() {
             <span class="susp-kind">이름 같고 번호 다름</span>
             <span class="susp-why">{{ g.name }}</span>
             <button v-for="f in g.folders" :key="f" class="susp-folder" @click="searchFolder(f)">{{ f }}</button>
-            <button class="susp-merge" @click="mergePatients(g.folders)">합치기…</button>
+            <button class="susp-merge" @click="openMerge(g.folders)">합치기…</button>
           </div>
           <div v-for="g in susp.case2" :key="'c' + g.num" class="susp-item">
             <span class="susp-kind alt">번호 같고 이름 다름</span>
@@ -458,6 +426,20 @@ function onViewerClose() {
       :first-run="firstRun"
       @close="showSettings = false"
       @saved="onSettingsSaved"
+    />
+    <PatientEditDialog
+      v-if="editing"
+      :patient="editing"
+      @close="editing = null"
+      @saved="onEdited"
+      @merge="mergeFromDialog"
+    />
+    <MergeReviewDialog
+      v-if="merging"
+      :folders="merging"
+      :patients="allPatients.length ? allPatients : patients"
+      @close="merging = null"
+      @done="onEdited"
     />
     <ImportWizard
       v-if="showImport"

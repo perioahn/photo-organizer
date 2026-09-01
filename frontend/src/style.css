@@ -382,3 +382,64 @@ body {
 .susp-merge:hover { filter: brightness(1.15); }
 .fdate-edit { cursor: pointer; }
 .fdate-edit:hover { text-decoration: underline dotted; }
+
+/* 편집 다이얼로그 */
+.dlg-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.55);
+  display: flex; align-items: center; justify-content: center; z-index: 60;
+}
+.dlg {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+  padding: 16px 18px; width: 440px; max-width: 92vw; max-height: 86vh; overflow: auto;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.5); display: flex; flex-direction: column; gap: 12px;
+}
+.dlg.wide { width: 560px; }
+.dlg-head { display: flex; align-items: center; justify-content: space-between; }
+.dlg-head h3 { font-size: 15px; }
+.dlg-field { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; }
+.dlg-field > span { color: var(--muted); }
+.dlg-field input[type="text"], .dlg-field input:not([type]) {
+  background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 7px; padding: 7px 10px; font-size: 13.5px;
+}
+.dlg-field input.bad { border-color: #ff7b72; }
+.dlg-err { color: #ffb4ab; font-size: 11.5px; font-style: normal; }
+.dlg-err.block { background: #4a1f1f; border-radius: 7px; padding: 7px 10px; }
+.dlg-muted { color: var(--muted); font-size: 11.5px; }
+.dlg-preview { font-size: 12px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.dlg-preview-label { color: var(--muted); }
+.dlg-preview code, .dlg-plan code { background: var(--panel2); border-radius: 5px; padding: 1px 7px; }
+.dlg-preview code.new, .dlg-plan code.new { color: #8ae6a8; }
+.dlg-conflict {
+  background: #3a2b1f; border: 1px solid #a5723a; border-radius: 8px;
+  padding: 10px; font-size: 12px; display: flex; flex-direction: column; gap: 8px;
+}
+.dlg-conflict-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dlg-radio { display: flex; align-items: center; gap: 6px; padding: 3px 0; cursor: pointer; }
+.dlg-plan { display: flex; flex-direction: column; gap: 8px; font-size: 12px; }
+.dlg-plan-row { display: flex; flex-direction: column; gap: 3px; }
+.dlg-merge-list { margin: 2px 0 0 14px; color: var(--muted); font-size: 11.5px; }
+.dlg-actions { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+.dlg-actions > .dlg-muted { margin-right: auto; }
+.dlg-actions button, .dlg-conflict button {
+  background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 7px; padding: 6px 14px; cursor: pointer; font-size: 12.5px;
+}
+.dlg-actions button.accent, .dlg-conflict button.accent {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+}
+.dlg-actions button:disabled { opacity: 0.4; cursor: default; }
+/* 촬영일 팝오버 */
+.fdate-wrap { position: relative; }
+.date-pop {
+  position: absolute; top: 110%; left: 0; z-index: 20; display: flex; gap: 5px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  padding: 7px; box-shadow: 0 4px 16px rgba(0,0,0,0.45);
+}
+.date-pop input { background: var(--panel2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px; padding: 4px 7px; }
+.date-pop button {
+  background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 12px;
+}
+.date-pop button.accent { background: var(--accent); border-color: var(--accent); color: #fff; }

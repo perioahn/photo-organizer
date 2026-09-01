@@ -79,6 +79,10 @@ class WriteError(Exception):
     pass
 
 
+class StaleError(WriteError):
+    """편집 시작 이후 대상이 바뀜 — 덮어쓰기 방지."""
+
+
 def validate_folder_name(name: str) -> None:
     if not name or name.startswith(" ") or name.endswith((" ", ".")):
         raise WriteError("폴더명이 비었거나 앞뒤 공백/마침표")
@@ -144,8 +148,13 @@ def rename_folder(root: str, folder_id: int, new_name: str, reason: str = "manua
     return {"run_id": run_id, "old": old_name, "new": new_name, "noop": False}
 
 
-def rename_patient(root: str, patient_id: int, num: str, name: str) -> dict:
-    """환자 폴더(A폴더) 이름 변경 — 진료번호/이름 오타 수정용. 저널로 undo 가능."""
+def rename_patient(root: str, patient_id: int, num: str, name: str,
+                   expect_folder: str | None = None) -> dict:
+    """환자 폴더(A폴더) 이름 변경 — 진료번호/이름 오타 수정용. 저널로 undo 가능.
+
+    expect_folder: 편집 시작 시점의 폴더명. 그 사이 디스크가 바뀌었으면 StaleError
+    (사용자가 보던 내용과 다른 대상을 덮어쓰지 않게 — Codex 자문).
+    """
     num, name = (num or "").strip(), (name or "").strip()
     if not re.fullmatch(r"\d{8}", num):
         raise WriteError("진료번호는 숫자 8자리여야 합니다")
@@ -161,6 +170,8 @@ def rename_patient(root: str, patient_id: int, num: str, name: str) -> dict:
         if r is None:
             raise WriteError("환자가 인덱스에 없음 (rescan 필요)")
         old_folder = r["folder_name"]
+        if expect_folder is not None and expect_folder != old_folder:
+            raise StaleError(f"편집 중 폴더가 바뀌었습니다: {expect_folder} → {old_folder}")
         if old_folder == new_folder:
             return {"run_id": None, "old": old_folder, "new": new_folder, "noop": True}
         old_path = os.path.join(root, old_folder)
@@ -184,7 +195,23 @@ def rename_patient(root: str, patient_id: int, num: str, name: str) -> dict:
     return {"run_id": run_id, "old": old_folder, "new": new_folder, "noop": False}
 
 
-def merge_patients(root: str, src_id: int, dst_id: int, dry_run: bool = False) -> dict:
+def _merge_token(root: str, src_folder: str, dst_folder: str) -> str:
+    """합치기 검토 시점의 상태 지문 — 검토 후 폴더가 바뀌면 실행을 막는다."""
+    import hashlib
+    h = hashlib.sha1()
+    for f in (src_folder, dst_folder):
+        d = os.path.join(root, f)
+        h.update(f.encode("utf-8"))
+        try:
+            for n in sorted(os.listdir(d)):
+                h.update(b"|" + n.encode("utf-8"))
+        except OSError:
+            h.update(b"|<missing>")
+    return h.hexdigest()[:16]
+
+
+def merge_patients(root: str, src_id: int, dst_id: int, dry_run: bool = False,
+                   token: str | None = None) -> dict:
     """환자 폴더 합치기 — src의 촬영일 폴더를 dst로 이동 (번호 오타로 갈라진 환자 복구).
 
     같은 날짜(date6) 폴더가 양쪽에 있으면 dst 폴더로 사진만 옮겨 합치고, 태그는
@@ -230,12 +257,15 @@ def merge_patients(root: str, src_id: int, dst_id: int, dry_run: bool = False) -
                 rest = tagsort.sort_tags([t for t in merged if not t.startswith("@")], cfg)
                 new_twin = d6 + ("_" + "_".join(status + rest) if (status + rest) else "")
                 merges.append((n, twin, new_twin))
+        cur_token = _merge_token(root, by_id[src_id], by_id[dst_id])
         plan = {"src": by_id[src_id], "dst": by_id[dst_id],
-                "move": len(moves), "merge": len(merges),
+                "move": len(moves), "merge": len(merges), "token": cur_token,
                 "details": {"moves": [m[0] for m in moves],
                             "merges": [[m[0], m[1]] for m in merges]}}
         if dry_run:
             return {**plan, "dry_run": True}
+        if token is not None and token != cur_token:
+            raise StaleError("검토 후 폴더 상태가 바뀌었습니다 — 다시 검토해 주세요")
 
         renames: list[list[str]] = []
         for src_name, dst_name in moves:

@@ -91,11 +91,22 @@ function fmtDate(d: string | null): string {
   return `20${d.slice(0, 2)}-${d.slice(2, 4)}-${d.slice(4, 6)}`
 }
 
+const dateOpen = ref(false)
+const dateVal = ref('')
+
+function openDateEdit() {
+  const d = props.folder.date6
+  if (!d) return
+  dateVal.value = `20${d.slice(0, 2)}-${d.slice(2, 4)}-${d.slice(4, 6)}`
+  dateOpen.value = true
+}
+
 async function editDate() {
   const cur = props.folder.date6
   if (!cur) return
-  const v = window.prompt('촬영일 (YYMMDD)', cur)?.trim()
-  if (!v || v === cur) return
+  const v = dateVal.value.replace(/-/g, '').slice(2)  // YYYY-MM-DD → YYMMDD
+  dateOpen.value = false
+  if (!/^\d{6}$/.test(v) || v === cur) return
   try {
     const res = await fetch(`/api/folder/${props.folder.id}/date`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -126,8 +137,16 @@ watch(() => props.showSub, (v) => { subOpen.value = v ?? false })
       <span v-if="patientLabel" class="fpatient">{{ patientLabel }}</span>
       <button v-if="patientLabel" class="icon-btn" title="진료번호·이름 수정"
               @click.stop="emit('editPatient')">✏</button>
-      <span v-if="folder.date6" class="fdate fdate-edit" title="촬영일 수정"
-            @click.stop="editDate">{{ fmtDate(folder.date6) }}</span>
+      <span v-if="folder.date6" class="fdate-wrap">
+        <span class="fdate fdate-edit" title="촬영일 수정"
+              @click.stop="openDateEdit">{{ fmtDate(folder.date6) }}</span>
+        <span v-if="dateOpen" class="date-pop" @click.stop>
+          <input type="date" v-model="dateVal" @keydown.enter.prevent="editDate"
+                 @keydown.esc.prevent="dateOpen = false" />
+          <button class="accent" @click="editDate">변경</button>
+          <button @click="dateOpen = false">취소</button>
+        </span>
+      </span>
       <span v-else class="fname">{{ folder.name }}</span>
       <span
         v-for="t in displayTags"
